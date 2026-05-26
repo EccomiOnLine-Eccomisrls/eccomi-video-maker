@@ -1,0 +1,8 @@
+runpod
+torch
+diffusers
+transformers
+accelerate
+imageio[ffmpeg]
+requests
+supabase
