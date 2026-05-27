@@ -6,3 +6,5 @@ accelerate
 imageio[ffmpeg]
 requests
 supabase
+tiktoken
+sentencepiece
