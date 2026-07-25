@@ -28,22 +28,36 @@ if not BASE_SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(BASE_SUPABASE_URL, SUPABASE_KEY)
 
-# 2. Caricamento del Modello Wan 2.1-14B HD Image-To-Video
-print("--> [MODEL] Caricamento di Wan 2.1 14B (720P) in corso su GPU PRO...", flush=True)
+# 2. Caricamento del Modello Wan 2.1 14B HD Image-To-Video
+print(
+    "--> [MODEL] Caricamento di Wan 2.1 14B (720P) in corso su GPU PRO...",
+    flush=True,
+)
 
 try:
-    from diffusers import WanImageToVideoPipeline
+    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
     from diffusers.utils import export_to_video
 
+    model_id = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
+
+    # Carica VAE in float32 per evitare artefatti e il modello in bfloat16 per massima resa su GPU PRO
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id, subfolder="vae", torch_dtype=torch.float32
+    )
     pipe = WanImageToVideoPipeline.from_pretrained(
-        "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers",
-        torch_dtype=torch.bfloat16,
+        model_id, vae=vae, torch_dtype=torch.bfloat16
     )
     pipe.to("cuda")
-    print("--> [MODEL] Wan 2.1 14B Caricato con successo!", flush=True)
+
+    print(
+        "--> [MODEL] Wan 2.1 14B 720P Caricato ed Ottimizzato con successo!",
+        flush=True,
+    )
 
 except Exception as e:
-    print(f"⚠️ [MODEL FALLBACK] Impossibile caricare Wan 2.1 14B, tentiamo CogVideoX: {e}", flush=True)
+    print(
+        f"⚠️ [MODEL FALLBACK] Impossibile caricare Wan 2.1 14B: {e}", flush=True
+    )
     from diffusers import CogVideoXImageToVideoPipeline
     from diffusers.utils import export_to_video
 
@@ -51,6 +65,7 @@ except Exception as e:
         "THUDM/CogVideoX-5b-I2V", torch_dtype=torch.float16
     )
     pipe.enable_model_cpu_offload()
+
 
 
 def download_image(url: str) -> Image.Image:
