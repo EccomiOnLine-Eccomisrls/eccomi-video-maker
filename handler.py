@@ -7,6 +7,14 @@ import runpod
 from supabase import Client, create_client
 import torch
 
+# Import MoviePy per il montaggio ed estrazione audio
+from moviepy.editor import (
+    AudioFileClip,
+    CompositeAudioClip,
+    ConcatenateVideoClips,
+    VideoFileClip,
+)
+
 print("--> [INIT] Avvio dello script handler.py...", flush=True)
 
 # 1. Variabili d'ambiente e Client Supabase
@@ -18,14 +26,6 @@ if not BASE_SUPABASE_URL or not SUPABASE_KEY:
     print("⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate!", flush=True)
 
 supabase: Client = create_client(BASE_SUPABASE_URL, SUPABASE_KEY)
-
-# Import MoviePy per il montaggio ed estrazione audio
-from moviepy.editor import (
-    AudioFileClip,
-    CompositeAudioClip,
-    ConcatenateVideoClips,
-    VideoFileClip,
-)
 
 # 2. Caricamento del modello AI
 print("--> [MODEL] Caricamento di CogVideoX-5b-I2V in corso...", flush=True)
@@ -93,9 +93,12 @@ def extract_or_download_audio(url: str, output_audio_path: str):
                 flush=True,
             )
             output_audio_path = None
-        os.remove(temp_download)
+        if os.path.exists(temp_download):
+            os.remove(temp_download)
     else:
         # È già un file audio
+        if os.path.exists(output_audio_path):
+            os.remove(output_audio_path)
         os.rename(temp_download, output_audio_path)
 
 
@@ -124,9 +127,7 @@ def handler(event):
     job_id = event.get("id", "test_job")
 
     image_url = job_input.get("image_url")
-    voice_url = job_input.get(
-        "voice_audio_url"
-    )  # Può essere sia un file .mp3/.wav sia un video .mov/.mp4!
+    voice_url = job_input.get("voice_audio_url")
     music_url = job_input.get("music_audio_url")
 
     scenes_prompts = job_input.get(
@@ -166,7 +167,7 @@ def handler(event):
 
         audio_tracks = []
 
-        # 3. GESTIONE VOCE (Estrazione da Video o Audio diretto)
+        # 3. GESTIONE VOCE
         if voice_url:
             voice_audio_path = tempfile.NamedTemporaryFile(
                 suffix=".mp3", delete=False
@@ -194,7 +195,7 @@ def handler(event):
                 )
                 audio_tracks.append(music_clip)
 
-        # Mix finale traccia audio + musica
+        # Mix finale
         if audio_tracks:
             print(
                 "--> [AUDIO] Unione traccia vocale e musica di sottofondo...",
@@ -218,7 +219,7 @@ def handler(event):
             preset="fast",
         )
 
-        # 6. UPLOAD SU SUPABASE (Bucket 'videos')
+        # 6. UPLOAD SU SUPABASE
         print("--> [UPLOAD] Caricamento spot su Supabase...", flush=True)
         object_path = f"{job_id}_spot.mp4"
 
