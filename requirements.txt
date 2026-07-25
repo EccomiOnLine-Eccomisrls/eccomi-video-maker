@@ -8,7 +8,7 @@ accelerate==0.33.0
 runpod
 imageio[ffmpeg]
 imageio-ffmpeg
-moviepy
+moviepy==1.0.3
 requests
 supabase
 tiktoken
