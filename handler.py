@@ -7,13 +7,21 @@ import runpod
 from supabase import Client, create_client
 import torch
 
-# Import MoviePy per il montaggio ed estrazione audio
-from moviepy.editor import (
-    AudioFileClip,
-    CompositeAudioClip,
-    ConcatenateVideoClips,
-    VideoFileClip,
-)
+# Import flessibile per MoviePy (compatibile sia con v1.x che v2.x)
+try:
+    from moviepy.editor import (
+        AudioFileClip,
+        CompositeAudioClip,
+        VideoFileClip,
+        concatenate_videoclips,
+    )
+except ImportError:
+    from moviepy import (
+        AudioFileClip,
+        CompositeAudioClip,
+        VideoFileClip,
+        concatenate_videoclips,
+    )
 
 print("--> [INIT] Avvio dello script handler.py...", flush=True)
 
@@ -174,7 +182,7 @@ def handler(event):
             ).name
             extract_or_download_audio(voice_url, voice_audio_path)
 
-            if os.path.exists(voice_audio_path):
+            if voice_audio_path and os.path.exists(voice_audio_path):
                 temp_audio_files.append(voice_audio_path)
                 voice_clip = AudioFileClip(voice_audio_path)
                 audio_tracks.append(voice_clip)
@@ -186,13 +194,22 @@ def handler(event):
             ).name
             extract_or_download_audio(music_url, music_audio_path)
 
-            if os.path.exists(music_audio_path):
+            if music_audio_path and os.path.exists(music_audio_path):
                 temp_audio_files.append(music_audio_path)
-                music_clip = (
-                    AudioFileClip(music_audio_path)
-                    .volumex(0.15)
-                    .set_duration(final_video_base.duration)
-                )
+                music_clip = AudioFileClip(music_audio_path)
+                
+                # Gestione volume sia per MoviePy v1 che v2
+                if hasattr(music_clip, 'volumex'):
+                    music_clip = music_clip.volumex(0.15)
+                elif hasattr(music_clip, 'with_volume_scaling'):
+                    music_clip = music_clip.with_volume_scaling(0.15)
+
+                # Imposta durata
+                if hasattr(music_clip, 'set_duration'):
+                    music_clip = music_clip.set_duration(final_video_base.duration)
+                elif hasattr(music_clip, 'with_duration'):
+                    music_clip = music_clip.with_duration(final_video_base.duration)
+
                 audio_tracks.append(music_clip)
 
         # Mix finale
@@ -202,7 +219,10 @@ def handler(event):
                 flush=True,
             )
             final_audio = CompositeAudioClip(audio_tracks)
-            final_video = final_video_base.set_audio(final_audio)
+            if hasattr(final_video_base, 'set_audio'):
+                final_video = final_video_base.set_audio(final_audio)
+            else:
+                final_video = final_video_base.with_audio(final_audio)
         else:
             final_video = final_video_base
 
