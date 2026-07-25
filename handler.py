@@ -5,21 +5,22 @@ import tempfile
 import os
 from io import BytesIO
 from PIL import Image
+from supabase import create_client, Client
 
-# Print immediati con flush=True per garantire la presenza nei log di RunPod
 print("--> [INIT] Avvio dello script handler.py...", flush=True)
 
-# 1. Verifica e inizializzazione sicura delle variabili d'ambiente
+# 1. Variabili d'ambiente e Client Supabase
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
-
-# Rimuove eventuali slash finali per evitare il problema del doppio slash // nell'URL
 BASE_SUPABASE_URL = SUPABASE_URL.rstrip("/")
 
 if not BASE_SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate correttamente nelle Environment Variables di RunPod!", flush=True)
+    print("⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate nelle Environment Variables!", flush=True)
 
-# 2. Caricamento ottimizzato del modello AI
+# Inizializzazione del client Supabase
+supabase: Client = create_client(BASE_SUPABASE_URL, SUPABASE_KEY)
+
+# 2. Caricamento del modello AI
 print("--> [MODEL] Caricamento di CogVideoX-5b-I2V in corso...", flush=True)
 
 try:
@@ -31,7 +32,6 @@ try:
         torch_dtype=torch.float16
     )
 
-    # OTTIMIZZAZIONE VRAM FONDAMENTALE PER EVITARE OOM / CRASH
     pipe.enable_model_cpu_offload()
     pipe.vae.enable_slicing()
     pipe.vae.enable_tiling()
@@ -77,7 +77,7 @@ def handler(event):
             image=init_image,
             prompt=prompt,
             num_frames=49,
-            num_inference_steps=35,     # Ridotto a 35 per velocizzare l'elaborazione
+            num_inference_steps=35,
             guidance_scale=6.0,
             generator=torch.Generator("cuda").manual_seed(42)
         ).frames[0]
@@ -91,22 +91,15 @@ def handler(event):
         print("--> Caricamento del video su Supabase...", flush=True)
         object_path = f"video_generati/{job_id}.mp4"
         
-        # URL formattato correttamente senza doppi slash
-        upload_url = f"{BASE_SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}?upsert=true"
-        
+        # Upload tramite SDK Supabase
         with open(video_path, "rb") as f:
-            video_data = f.read()
-            
-        headers = {
-            "Authorization": f"Bearer {SUPABASE_KEY}",
-            "apikey": SUPABASE_KEY,
-            "Content-Type": "video/mp4",
-        }
+            supabase.storage.from_("inputs").upload(
+                path=object_path,
+                file=f,
+                file_options={"content-type": "video/mp4", "upsert": "true"}
+            )
         
-        r_upload = requests.put(upload_url, headers=headers, data=video_data, timeout=60)
-        r_upload.raise_for_status()
-        
-        public_video_url = f"{BASE_SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}"
+        public_video_url = supabase.storage.from_("inputs").get_public_url(object_path)
         
         if os.path.exists(video_path):
             os.remove(video_path)
@@ -119,5 +112,4 @@ def handler(event):
         return {"error": str(e)}
 
 
-# Avvio dell'handler serverless
 runpod.serverless.start({"handler": handler})
