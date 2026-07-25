@@ -15,6 +15,9 @@ RUN apt-get update && apt-get install -y \
     libpng-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# AGGIORNAMENTO Torch: Rende PyTorch compatibile con diffusers 0.33+ per evitare errori xpu/CUDA
+RUN pip install --no-cache-dir --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+
 # Copia e installa i requisiti Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
