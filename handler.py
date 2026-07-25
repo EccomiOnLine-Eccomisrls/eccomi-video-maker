@@ -1,6 +1,7 @@
-from io import BytesIO
 import os
 import tempfile
+from io import BytesIO
+from PIL import Image
 import requests
 import runpod
 from supabase import Client, create_client
@@ -14,13 +15,11 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 BASE_SUPABASE_URL = SUPABASE_URL.rstrip("/")
 
 if not BASE_SUPABASE_URL or not SUPABASE_KEY:
-    print(
-        "⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate!", flush=True
-    )
+    print("⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate!", flush=True)
 
 supabase: Client = create_client(BASE_SUPABASE_URL, SUPABASE_KEY)
 
-# Import MoviePy per il montaggio automatico
+# Import MoviePy per il montaggio ed estrazione audio
 from moviepy.editor import (
     AudioFileClip,
     CompositeAudioClip,
@@ -51,23 +50,56 @@ except Exception as e:
     raise e
 
 
-def download_image(url: str):
+def download_image(url: str) -> Image.Image:
     response = requests.get(url, timeout=30)
     response.raise_for_status()
-    from PIL import Image
-
     return Image.open(BytesIO(response.content)).convert("RGB")
 
 
 def download_file(url: str, output_path: str):
-    """Scarica file audio locali o da URL pubblico"""
-    response = requests.get(url, timeout=30)
+    """Scarica un file generico da URL"""
+    response = requests.get(url, timeout=60)
     response.raise_for_status()
     with open(output_path, "wb") as f:
         f.write(response.content)
 
 
-def generate_single_clip(image, prompt: str) -> str:
+def extract_or_download_audio(url: str, output_audio_path: str):
+    """
+    Scarica l'URL fornito:
+    - Se è un video (.mov, .mp4, ecc.), estrae automaticamente la traccia audio.
+    - Se è già un audio (.mp3, .wav, ecc.), lo salva direttamente.
+    """
+    temp_download = tempfile.NamedTemporaryFile(delete=False).name
+    download_file(url, temp_download)
+
+    video_extensions = [".mov", ".mp4", ".avi", ".mkv", ".webm", ".quicktime"]
+    is_video = any(url.lower().endswith(ext) for ext in video_extensions)
+
+    if is_video:
+        print(
+            f"--> [AUDIO EXTRACT] Rilevato file video da {url}. Estraggo la traccia audio...",
+            flush=True,
+        )
+        video_clip = VideoFileClip(temp_download)
+        if video_clip.audio is not None:
+            video_clip.audio.write_audiofile(
+                output_audio_path, logger=None, fps=44100
+            )
+            video_clip.close()
+        else:
+            print(
+                "⚠️ WARNING: Il video scaricato non contiene tracce audio!",
+                flush=True,
+            )
+            output_audio_path = None
+        os.remove(temp_download)
+    else:
+        # È già un file audio
+        os.rename(temp_download, output_audio_path)
+
+
+def generate_single_clip(image: Image.Image, prompt: str) -> str:
     """Genera uno spezzone di video con CogVideoX"""
     print(f"--> [AI GENERATION] Genero clip per: '{prompt}'", flush=True)
     enhanced_prompt = f"{prompt}, cinematic lighting, photorealistic, 4k resolution, smooth motion, high detail"
@@ -75,14 +107,13 @@ def generate_single_clip(image, prompt: str) -> str:
     frames = pipe(
         image=image,
         prompt=enhanced_prompt,
-        num_frames=49,  # ~4 secondi di clip base
+        num_frames=49,
         num_inference_steps=35,
         guidance_scale=6.0,
         generator=torch.Generator("cuda").manual_seed(42),
     ).frames[0]
 
     temp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    # Esportiamo a 24 FPS per rendere il movimento ultra-fluido
     export_to_video(frames, temp_file.name, fps=24)
     return temp_file.name
 
@@ -93,18 +124,15 @@ def handler(event):
     job_id = event.get("id", "test_job")
 
     image_url = job_input.get("image_url")
-    voice_audio_url = job_input.get(
+    voice_url = job_input.get(
         "voice_audio_url"
-    )  # Traccia audio con la voce del personaggio
-    music_audio_url = job_input.get(
-        "music_audio_url"
-    )  # Traccia musicale di sottofondo
+    )  # Può essere sia un file .mp3/.wav sia un video .mov/.mp4!
+    music_url = job_input.get("music_audio_url")
 
-    # Prompts per le varie scene che compongono lo spot da 20-30s
     scenes_prompts = job_input.get(
         "scenes_prompts",
         [
-            "Character standing heroically in front of city skyline, looking at camera",
+            "Character standing heroically in front of city skyline, looking dynamically at camera",
             "Character pointing dynamically to a glowing hologram product screen",
             "Character smiling and giving a thumb up in a high tech office, dynamic movement",
             "Cinematic dramatic zoom out, character holding a badge with logo",
@@ -120,7 +148,7 @@ def handler(event):
     try:
         init_image = download_image(image_url)
 
-        # 1. GENERAZIONE MULTI-SCENA (Loop per coprire la durata dello spot)
+        # 1. GENERAZIONE SCENE VIDEO
         for idx, scene_prompt in enumerate(scenes_prompts):
             print(
                 f"--> Generating Scene {idx+1}/{len(scenes_prompts)}...",
@@ -129,7 +157,7 @@ def handler(event):
             clip_path = generate_single_clip(init_image, scene_prompt)
             generated_clip_paths.append(clip_path)
 
-        # 2. MONTAGGIO VIDEO (MoviePy)
+        # 2. MONTAGGIO VIDEO
         print("--> [MONTAGGIO] Unisco le clip generate...", flush=True)
         video_clips = [VideoFileClip(p) for p in generated_clip_paths]
         final_video_base = concatenate_videoclips(
@@ -138,44 +166,50 @@ def handler(event):
 
         audio_tracks = []
 
-        # 3. GESTIONE AUDIO (Voce + Musica)
-        if voice_audio_url:
-            voice_path = tempfile.NamedTemporaryFile(
+        # 3. GESTIONE VOCE (Estrazione da Video o Audio diretto)
+        if voice_url:
+            voice_audio_path = tempfile.NamedTemporaryFile(
                 suffix=".mp3", delete=False
             ).name
-            download_file(voice_audio_url, voice_path)
-            temp_audio_files.append(voice_path)
+            extract_or_download_audio(voice_url, voice_audio_path)
 
-            voice_clip = AudioFileClip(voice_path)
-            audio_tracks.append(voice_clip)
+            if os.path.exists(voice_audio_path):
+                temp_audio_files.append(voice_audio_path)
+                voice_clip = AudioFileClip(voice_audio_path)
+                audio_tracks.append(voice_clip)
 
-        if music_audio_url:
-            music_path = tempfile.NamedTemporaryFile(
+        # 4. GESTIONE MUSICA DI SOTTOFONDO
+        if music_url:
+            music_audio_path = tempfile.NamedTemporaryFile(
                 suffix=".mp3", delete=False
             ).name
-            download_file(music_audio_url, music_path)
-            temp_audio_files.append(music_path)
+            extract_or_download_audio(music_url, music_audio_path)
 
-            music_clip = (
-                AudioFileClip(music_path)
-                .volumex(0.15)
-                .set_duration(final_video_base.duration)
-            )
-            audio_tracks.append(music_clip)
+            if os.path.exists(music_audio_path):
+                temp_audio_files.append(music_audio_path)
+                music_clip = (
+                    AudioFileClip(music_audio_path)
+                    .volumex(0.15)
+                    .set_duration(final_video_base.duration)
+                )
+                audio_tracks.append(music_clip)
 
-        # Se sono stati forniti audio, mixali e inseriscili nel video
+        # Mix finale traccia audio + musica
         if audio_tracks:
-            print("--> [AUDIO] Mixaggio traccia audio e musica...", flush=True)
+            print(
+                "--> [AUDIO] Unione traccia vocale e musica di sottofondo...",
+                flush=True,
+            )
             final_audio = CompositeAudioClip(audio_tracks)
             final_video = final_video_base.set_audio(final_audio)
         else:
             final_video = final_video_base
 
-        # 4. ESPORTAZIONE E RENDER FINALE
+        # 5. ESPORTAZIONE SPOT COMPLETO
         output_spot_path = tempfile.NamedTemporaryFile(
             suffix=".mp4", delete=False
         ).name
-        print("--> [RENDER] Esportazione spot promozionale...", flush=True)
+        print("--> [RENDER] Esportazione spot finale...", flush=True)
         final_video.write_videofile(
             output_spot_path,
             fps=24,
@@ -184,8 +218,8 @@ def handler(event):
             preset="fast",
         )
 
-        # 5. UPLOAD SU SUPABASE BUCKET 'videos'
-        print("--> [UPLOAD] Caricamento spot finale su Supabase...", flush=True)
+        # 6. UPLOAD SU SUPABASE (Bucket 'videos')
+        print("--> [UPLOAD] Caricamento spot su Supabase...", flush=True)
         object_path = f"{job_id}_spot.mp4"
 
         with open(output_spot_path, "rb") as f:
@@ -201,7 +235,7 @@ def handler(event):
 
         # Pulizia file temporanei
         for p in generated_clip_paths + temp_audio_files + [output_spot_path]:
-            if os.path.exists(p):
+            if p and os.path.exists(p):
                 os.remove(p)
 
         print("✅ Spot Pubblicitario creato con successo!", flush=True)
