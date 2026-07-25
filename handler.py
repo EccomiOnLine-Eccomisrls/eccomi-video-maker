@@ -10,11 +10,14 @@ from PIL import Image
 print("--> [INIT] Avvio dello script handler.py...", flush=True)
 
 # 1. Verifica e inizializzazione sicura delle variabili d'ambiente
-SUPABASE_URL = os.environ.get("SUPABASE_URL")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    print("⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate nelle Environment Variables di RunPod!", flush=True)
+# Rimuove eventuali slash finali per evitare il problema del doppio slash // nell'URL
+BASE_SUPABASE_URL = SUPABASE_URL.rstrip("/")
+
+if not BASE_SUPABASE_URL or not SUPABASE_KEY:
+    print("⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate correttamente nelle Environment Variables di RunPod!", flush=True)
 
 # 2. Caricamento ottimizzato del modello AI
 print("--> [MODEL] Caricamento di CogVideoX-5b-I2V in corso...", flush=True)
@@ -87,7 +90,9 @@ def handler(event):
 
         print("--> Caricamento del video su Supabase...", flush=True)
         object_path = f"video_generati/{job_id}.mp4"
-        upload_url = f"{SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}?upsert=true"
+        
+        # URL formattato correttamente senza doppi slash
+        upload_url = f"{BASE_SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}?upsert=true"
         
         with open(video_path, "rb") as f:
             video_data = f.read()
@@ -101,7 +106,7 @@ def handler(event):
         r_upload = requests.put(upload_url, headers=headers, data=video_data, timeout=60)
         r_upload.raise_for_status()
         
-        public_video_url = f"{SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}"
+        public_video_url = f"{BASE_SUPABASE_URL}/storage/v1/object/public/inputs/{object_path}"
         
         if os.path.exists(video_path):
             os.remove(video_path)
