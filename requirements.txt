@@ -1,17 +1,13 @@
---extra-index-url https://download.pytorch.org/whl/cu118
-torch==2.1.0
-torchvision==0.16.0
-torchaudio==2.1.0
-diffusers==0.30.3
-transformers==4.44.2
-accelerate==0.33.0
 runpod
-imageio[ffmpeg]
-imageio-ffmpeg
-moviepy==1.0.3
 requests
-supabase
-tiktoken
+pillow
+torch
+torchvision
+torchaudio
+transformers
+diffusers>=0.33.0
+accelerate
 sentencepiece
+moviepy==1.0.3
+supabase
 protobuf
-
