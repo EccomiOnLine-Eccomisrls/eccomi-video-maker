@@ -122,11 +122,12 @@ def generate_single_clip_wan(image: Image.Image, prompt: str) -> str:
     frames = pipe(
         image=image,
         prompt=enhanced_prompt,
-        num_frames=49,             # Riduce i frame da 81 a 49 (3x più veloce)
-        num_inference_steps=30,    # Riduce i passi da 50 a 30 mantenendo un'ottima qualità
-        guidance_scale=6.0,
+        height=720,                # Forza altezza standard HD (16:9)
+        width=1280,                # Forza larghezza standard HD
+        num_frames=49,             # ~2 sec per scena
+        num_inference_steps=30,    # Bilanciamento perfetto qualità/velocità
+        guidance_scale=5.0,        # Evita artefatti cromatici e saturazioni
     ).frames[0]
-
 
     temp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     export_to_video(frames, temp_file.name, fps=24)
@@ -223,6 +224,7 @@ def handler(event):
             audio_codec="aac",
             preset="medium",
             bitrate="10000k",
+            ffmpeg_params=["-pix_fmt", "yuv420p"]  # Risolve lo spazio colore alterato su iOS/iPhone
         )
 
         # 6. UPLOAD SUPABASE
@@ -239,7 +241,6 @@ def handler(event):
 
         # URL pubblico diretto e garantito
         public_video_url = f"{BASE_SUPABASE_URL}/storage/v1/object/public/videos/{object_path}"
-
 
         # Pulizia
         for clip in video_clips:
