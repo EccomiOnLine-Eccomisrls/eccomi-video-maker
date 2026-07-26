@@ -227,7 +227,8 @@ def handler(event):
 
         # 6. UPLOAD SUPABASE
         print("--> [UPLOAD] Caricamento spot su Supabase...", flush=True)
-        object_path = f"{job_id}_spot_wan21.mp4"
+        safe_job_id = str(job_id).replace("/", "_")
+        object_path = f"{safe_job_id}_spot_wan21.mp4"
 
         with open(output_spot_path, "rb") as f:
             supabase.storage.from_("videos").upload(
@@ -236,7 +237,9 @@ def handler(event):
                 file_options={"content-type": "video/mp4", "upsert": "true"},
             )
 
-        public_video_url = supabase.storage.from_("videos").get_public_url(object_path)
+        # URL pubblico diretto e garantito
+        public_video_url = f"{BASE_SUPABASE_URL}/storage/v1/object/public/videos/{object_path}"
+
 
         # Pulizia
         for clip in video_clips:
