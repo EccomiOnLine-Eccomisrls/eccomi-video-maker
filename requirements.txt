@@ -11,3 +11,4 @@ sentencepiece
 moviepy==1.0.3
 supabase
 protobuf
+ftfy
