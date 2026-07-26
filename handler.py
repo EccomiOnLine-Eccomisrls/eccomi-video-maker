@@ -9,7 +9,6 @@ from supabase import Client, create_client
 import torch
 import ftfy
 
-
 # Import MoviePy v1.0.3
 from moviepy.editor import (
     AudioFileClip,
@@ -42,14 +41,19 @@ try:
 
     model_id = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 
-    # Carica VAE in float32 per evitare artefatti e il modello in bfloat16 per massima resa su GPU PRO
+    # Carica VAE in float32 e la pipeline in bfloat16
     vae = AutoencoderKLWan.from_pretrained(
         model_id, subfolder="vae", torch_dtype=torch.float32
     )
     pipe = WanImageToVideoPipeline.from_pretrained(
         model_id, vae=vae, torch_dtype=torch.bfloat16
     )
-    pipe.to("cuda")
+
+    # OTTIMIZZAZIONE VRAM FONDAMENTALE (Evita OOM su GPU 48GB)
+    if hasattr(pipe, "enable_model_cpu_offload"):
+        pipe.enable_model_cpu_offload()
+    else:
+        pipe.to("cuda")
 
     print(
         "--> [MODEL] Wan 2.1 14B 720P Caricato ed Ottimizzato con successo!",
@@ -67,7 +71,6 @@ except Exception as e:
         "THUDM/CogVideoX-5b-I2V", torch_dtype=torch.float16
     )
     pipe.enable_model_cpu_offload()
-
 
 
 def download_image(url: str) -> Image.Image:
