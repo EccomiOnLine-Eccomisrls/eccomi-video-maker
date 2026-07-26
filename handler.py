@@ -7,6 +7,8 @@ import requests
 import runpod
 from supabase import Client, create_client
 import torch
+import ftfy
+
 
 # Import MoviePy v1.0.3
 from moviepy.editor import (
