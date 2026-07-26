@@ -122,9 +122,11 @@ def generate_single_clip_wan(image: Image.Image, prompt: str) -> str:
     frames = pipe(
         image=image,
         prompt=enhanced_prompt,
-        num_frames=81,  # ~3.5 secondi per clip a 24fps
+        num_frames=49,             # Riduce i frame da 81 a 49 (3x più veloce)
+        num_inference_steps=30,    # Riduce i passi da 50 a 30 mantenendo un'ottima qualità
         guidance_scale=6.0,
     ).frames[0]
+
 
     temp_file = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     export_to_video(frames, temp_file.name, fps=24)
