@@ -1,16 +1,17 @@
 import gc
 import os
 import tempfile
+import time
 from io import BytesIO
 
-from PIL import Image, ImageOps
+from PIL import Image
 import requests
 import runpod
 from supabase import Client, create_client
 import torch
 import ftfy
 
-# Import MoviePy v1.0.3
+# MoviePy v1.0.3
 from moviepy.editor import (
     AudioFileClip,
     CompositeAudioClip,
@@ -18,10 +19,25 @@ from moviepy.editor import (
     concatenate_videoclips,
 )
 
+
+# ============================================================
+# 0. CONFIG PYTORCH / CUDA
+# ============================================================
+
 print(
-    "--> [INIT] Avvio dello script handler.py (Wan 2.1 14B High-Quality)...",
+    "--> [INIT] Avvio handler.py "
+    "(Wan 2.1 14B - 80GB FULL GPU MODE)...",
     flush=True,
 )
+
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception:
+        pass
+
 
 # ============================================================
 # 1. VARIABILI D'AMBIENTE E CLIENT SUPABASE
@@ -42,8 +58,9 @@ supabase: Client = create_client(
     SUPABASE_KEY,
 )
 
+
 # ============================================================
-# 2. CONFIG GENERALE
+# 2. CONFIG WAN
 # ============================================================
 
 MODEL_ID = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
@@ -51,281 +68,294 @@ MODEL_ID = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
 
-# Più sicuro su A40 rispetto a settaggi troppo aggressivi
-WAN_NUM_FRAMES = 41
-WAN_NUM_STEPS = 24
-WAN_GUIDANCE_SCALE = 4.5
+# ------------------------------------------------------------
+# BENCHMARK:
+# manteniamo gli stessi parametri usati sulla A40
+# per confrontare correttamente velocità e costo.
+# ------------------------------------------------------------
 
-# FPS finale volutamente non troppo alto:
-# con gli stessi frame ottieni una clip leggermente più lunga
-EXPORT_FPS = 16
+WAN_NUM_FRAMES = 33
+WAN_NUM_STEPS = 30
+WAN_GUIDANCE_SCALE = 5.0
+EXPORT_FPS = 24
+
 
 DEFAULT_SCENES = [
     (
-        "ECCOMI MAN, same illustrated superhero mascot from the reference image, "
-        "standing confidently, making a clear welcoming presentation gesture with one arm, "
-        "slight torso movement, subtle head movement, natural facial expression change, "
-        "gentle cape movement, stable character identity, stable costume details, "
-        "clean blue futuristic background"
-    ),
-    (
-        "ECCOMI MAN, same illustrated superhero mascot from the reference image, "
-        "presenting the ECCOMI ONLINE world with an open hand, "
-        "visible arm gesture, slight body shift, subtle smile change, "
-        "small expressive movement of shoulders and head, "
-        "soft cape flow, stable face and stable suit, "
-        "clean professional branded animation"
-    ),
+        "ECCOMI MAN, the exact official illustrated superhero mascot "
+        "from the reference image, confidently presenting the new "
+        "ECCOMI ONLINE website. "
+        "He performs one clear and controlled presenting gesture: "
+        "his open presenting arm moves smoothly outward and slightly upward, "
+        "his hand turns naturally toward the viewer, "
+        "his head makes a small natural turn and returns toward the viewer, "
+        "and his shoulders and upper torso shift subtly with the gesture. "
+        "His red cape moves gently behind him. "
+        "The movement must be clearly visible, smooth and professional. "
+        "Preserve his face, hairstyle, body proportions, costume, "
+        "red cape, red belt, gloves, boots and chest emblem. "
+        "Keep both feet fixed. "
+        "Fixed camera. No zoom. No scene change. "
+        "No morphing. No extra fingers. No extra limbs."
+    )
 ]
 
+
 # ============================================================
-# 3. CARICAMENTO MODELLO WAN 2.1 14B IMAGE-TO-VIDEO
+# 3. LOG MEMORIA GPU
 # ============================================================
 
+def log_gpu_memory(stage: str):
+    if not torch.cuda.is_available():
+        print(
+            f"--> [GPU] {stage}: CUDA non disponibile.",
+            flush=True,
+        )
+        return
+
+    device_index = torch.cuda.current_device()
+
+    props = torch.cuda.get_device_properties(device_index)
+
+    total_gb = props.total_memory / (1024 ** 3)
+
+    allocated_gb = (
+        torch.cuda.memory_allocated(device_index)
+        / (1024 ** 3)
+    )
+
+    reserved_gb = (
+        torch.cuda.memory_reserved(device_index)
+        / (1024 ** 3)
+    )
+
+    max_allocated_gb = (
+        torch.cuda.max_memory_allocated(device_index)
+        / (1024 ** 3)
+    )
+
+    print(
+        f"--> [GPU] {stage} | "
+        f"GPU={props.name} | "
+        f"VRAM totale={total_gb:.2f} GiB | "
+        f"allocata={allocated_gb:.2f} GiB | "
+        f"riservata={reserved_gb:.2f} GiB | "
+        f"picco={max_allocated_gb:.2f} GiB",
+        flush=True,
+    )
+
+
+# ============================================================
+# 4. CARICAMENTO MODELLO
+# ============================================================
+
+if not torch.cuda.is_available():
+    raise RuntimeError(
+        "CUDA non disponibile. "
+        "Questo handler richiede una GPU NVIDIA."
+    )
+
+
 print(
-    "--> [MODEL] Caricamento di Wan 2.1 14B (720P) in corso...",
+    "--> [MODEL] Modalità FULL GPU 80GB.",
     flush=True,
 )
 
+print(
+    "--> [MODEL] NESSUN CPU OFFLOAD.",
+    flush=True,
+)
+
+print(
+    "--> [MODEL] NESSUN DISK OFFLOAD.",
+    flush=True,
+)
+
+print(
+    f"--> [MODEL] Caricamento {MODEL_ID} direttamente su CUDA...",
+    flush=True,
+)
+
+
+model_load_start = time.perf_counter()
+
+
 try:
-    from diffusers import (
-        AutoencoderKLWan,
-        WanTransformer3DModel,
-        WanImageToVideoPipeline,
-    )
-    from diffusers.hooks.group_offloading import apply_group_offloading
+    from diffusers import WanImageToVideoPipeline
     from diffusers.utils import export_to_video
-    from transformers import (
-        UMT5EncoderModel,
-        CLIPVisionModel,
-    )
 
-    print(
-        "--> [MODEL] Caricamento componenti Wan 2.1 14B con Group Offloading...",
-        flush=True,
-    )
+    log_gpu_memory("Prima del caricamento modello")
 
     # --------------------------------------------------------
-    # DIRECTORY OFFLOAD
+    # FULL GPU LOAD
+    #
+    # device_map='cuda':
+    # i componenti vengono caricati direttamente sulla GPU.
+    #
+    # low_cpu_mem_usage=True:
+    # riduce il picco RAM durante il caricamento.
     # --------------------------------------------------------
-
-    offload_root = "/tmp/wan_group_offload"
-    text_offload_path = os.path.join(offload_root, "text_encoder")
-    transformer_offload_path = os.path.join(offload_root, "transformer")
-
-    os.makedirs(text_offload_path, exist_ok=True)
-    os.makedirs(transformer_offload_path, exist_ok=True)
-
-    print(
-        f"--> [OFFLOAD] Directory principale: {offload_root}",
-        flush=True,
-    )
-
-    # --------------------------------------------------------
-    # IMAGE ENCODER
-    # --------------------------------------------------------
-
-    print(
-        "--> [MODEL] Carico CLIP Image Encoder...",
-        flush=True,
-    )
-
-    image_encoder = CLIPVisionModel.from_pretrained(
-        MODEL_ID,
-        subfolder="image_encoder",
-        torch_dtype=torch.float32,
-    )
-
-    # --------------------------------------------------------
-    # TEXT ENCODER
-    # --------------------------------------------------------
-
-    print(
-        "--> [MODEL] Carico UMT5 Text Encoder...",
-        flush=True,
-    )
-
-    text_encoder = UMT5EncoderModel.from_pretrained(
-        MODEL_ID,
-        subfolder="text_encoder",
-        torch_dtype=torch.bfloat16,
-    )
-
-    # --------------------------------------------------------
-    # VAE
-    # --------------------------------------------------------
-
-    print(
-        "--> [MODEL] Carico Wan VAE...",
-        flush=True,
-    )
-
-    vae = AutoencoderKLWan.from_pretrained(
-        MODEL_ID,
-        subfolder="vae",
-        torch_dtype=torch.float32,
-    )
-
-    # --------------------------------------------------------
-    # TRANSFORMER
-    # --------------------------------------------------------
-
-    print(
-        "--> [MODEL] Carico Wan Transformer 14B...",
-        flush=True,
-    )
-
-    transformer = WanTransformer3DModel.from_pretrained(
-        MODEL_ID,
-        subfolder="transformer",
-        torch_dtype=torch.bfloat16,
-    )
-
-    # --------------------------------------------------------
-    # DEVICE
-    # --------------------------------------------------------
-
-    onload_device = torch.device("cuda")
-    offload_device = torch.device("cpu")
-
-    # --------------------------------------------------------
-    # OFFLOAD TEXT ENCODER
-    # --------------------------------------------------------
-
-    print(
-        "--> [OFFLOAD] Configuro Text Encoder...",
-        flush=True,
-    )
-
-    apply_group_offloading(
-        text_encoder,
-        onload_device=onload_device,
-        offload_device=offload_device,
-        offload_type="block_level",
-        num_blocks_per_group=4,
-        use_stream=False,
-        offload_to_disk_path=text_offload_path,
-    )
-
-    # --------------------------------------------------------
-    # OFFLOAD TRANSFORMER
-    # --------------------------------------------------------
-
-    print(
-        "--> [OFFLOAD] Configuro Transformer...",
-        flush=True,
-    )
-
-    transformer.enable_group_offload(
-        onload_device=onload_device,
-        offload_device=offload_device,
-        offload_type="leaf_level",
-        use_stream=False,
-        offload_to_disk_path=transformer_offload_path,
-    )
-
-    # --------------------------------------------------------
-    # PIPELINE
-    # --------------------------------------------------------
-
-    print(
-        "--> [MODEL] Creo Wan Image-To-Video Pipeline...",
-        flush=True,
-    )
 
     pipe = WanImageToVideoPipeline.from_pretrained(
         MODEL_ID,
-        vae=vae,
-        transformer=transformer,
-        text_encoder=text_encoder,
-        image_encoder=image_encoder,
         torch_dtype=torch.bfloat16,
+        device_map="cuda",
+        low_cpu_mem_usage=True,
     )
 
-    # Ottimizzazioni leggere e sicure
+    # --------------------------------------------------------
+    # VAE TILING / SLICING
+    #
+    # Manteniamo queste protezioni perché possono ridurre
+    # i picchi durante encoding/decoding senza ricorrere
+    # al disk offload.
+    # --------------------------------------------------------
+
     if hasattr(pipe, "enable_vae_slicing"):
-        pipe.enable_vae_slicing()
+        try:
+            pipe.enable_vae_slicing()
+            print(
+                "--> [MODEL] VAE slicing attivo.",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"--> [MODEL] VAE slicing non applicato: {e}",
+                flush=True,
+            )
 
     if hasattr(pipe, "enable_vae_tiling"):
-        pipe.enable_vae_tiling()
+        try:
+            pipe.enable_vae_tiling()
+            print(
+                "--> [MODEL] VAE tiling attivo.",
+                flush=True,
+            )
+        except Exception as e:
+            print(
+                f"--> [MODEL] VAE tiling non applicato: {e}",
+                flush=True,
+            )
 
-    # Importante: lasciamo fare agli hook di offload
+    # Il model card ufficiale mostra anche pipe.to("cuda").
+    # Con device_map="cuda" dovrebbe essere già su GPU,
+    # ma lo lasciamo come verifica esplicita.
     pipe.to("cuda")
 
     torch.cuda.empty_cache()
     gc.collect()
 
+    model_load_seconds = (
+        time.perf_counter() - model_load_start
+    )
+
     print(
-        "--> [MODEL] Wan 2.1 14B 720P + GROUP OFFLOAD caricato con successo!",
+        f"✅ [MODEL] Wan 2.1 14B FULL GPU caricato "
+        f"in {model_load_seconds:.1f} secondi.",
         flush=True,
     )
+
+    log_gpu_memory("Dopo caricamento modello")
 
 except Exception as e:
     print(
-        f"⚠️ [MODEL FALLBACK] Impossibile caricare Wan 2.1 14B: {e}",
+        "❌ [MODEL] ERRORE caricamento Wan FULL GPU:",
         flush=True,
     )
 
-    from diffusers import CogVideoXImageToVideoPipeline
-    from diffusers.utils import export_to_video
-
-    pipe = CogVideoXImageToVideoPipeline.from_pretrained(
-        "THUDM/CogVideoX-5b-I2V",
-        torch_dtype=torch.float16,
+    print(
+        str(e),
+        flush=True,
     )
-    pipe.enable_model_cpu_offload()
+
+    # IMPORTANTE:
+    # niente fallback automatico a CogVideoX o disk offload.
+    #
+    # Per questo benchmark vogliamo sapere chiaramente
+    # se Wan 14B entra oppure no nella GPU 80GB.
+    raise
+
 
 # ============================================================
-# 4. UTILS IMMAGINE
+# 5. UTILS
 # ============================================================
 
 def sanitize_text(text: str) -> str:
     if not text:
         return ""
-    return ftfy.fix_text(str(text)).strip()
+
+    return ftfy.fix_text(
+        str(text)
+    ).strip()
 
 
-def download_image(url: str) -> Image.Image:
-    response = requests.get(url, timeout=30)
-    response.raise_for_status()
-    return Image.open(BytesIO(response.content)).convert("RGB")
-
-
-def prepare_image_for_wan(image: Image.Image) -> Image.Image:
-    """
-    Adatta l'immagine al formato 16:9 richiesto dal video finale,
-    evitando risultati strani o bande non volute.
-    """
-    image = ImageOps.exif_transpose(image).convert("RGB")
-
-    # Crop intelligente centrato a 1280x720
-    prepared = ImageOps.fit(
-        image,
-        (TARGET_WIDTH, TARGET_HEIGHT),
-        method=Image.LANCZOS,
-        centering=(0.5, 0.5),
+def make_temp_path(suffix: str) -> str:
+    temp_file = tempfile.NamedTemporaryFile(
+        suffix=suffix,
+        delete=False,
     )
 
-    return prepared
+    path = temp_file.name
+    temp_file.close()
+
+    return path
+
 
 # ============================================================
-# 5. DOWNLOAD FILE
+# 6. DOWNLOAD IMMAGINE
 # ============================================================
 
-def download_file(url: str, output_path: str):
-    response = requests.get(url, timeout=60)
+def download_image(url: str) -> Image.Image:
+    response = requests.get(
+        url,
+        timeout=30,
+    )
+
     response.raise_for_status()
-    with open(output_path, "wb") as f:
+
+    image = Image.open(
+        BytesIO(response.content)
+    ).convert("RGB")
+
+    return image
+
+
+# ============================================================
+# 7. DOWNLOAD FILE
+# ============================================================
+
+def download_file(
+    url: str,
+    output_path: str,
+):
+    response = requests.get(
+        url,
+        timeout=60,
+    )
+
+    response.raise_for_status()
+
+    with open(
+        output_path,
+        "wb",
+    ) as f:
         f.write(response.content)
 
+
 # ============================================================
-# 6. AUDIO
+# 8. AUDIO
 # ============================================================
 
-def extract_or_download_audio(url: str, output_audio_path: str):
-    temp_download = tempfile.NamedTemporaryFile(delete=False).name
+def extract_or_download_audio(
+    url: str,
+    output_audio_path: str,
+):
+    temp_download = make_temp_path("")
 
-    download_file(url, temp_download)
+    download_file(
+        url,
+        temp_download,
+    )
 
     video_extensions = [
         ".mov",
@@ -336,61 +366,106 @@ def extract_or_download_audio(url: str, output_audio_path: str):
         ".quicktime",
     ]
 
-    is_video = any(url.lower().endswith(ext) for ext in video_extensions)
+    clean_url = (
+        url.lower()
+        .split("?")[0]
+        .split("#")[0]
+    )
+
+    is_video = any(
+        clean_url.endswith(ext)
+        for ext in video_extensions
+    )
 
     if is_video:
+
         print(
-            f"--> [AUDIO] Estraggo l'audio da file video: {url}...",
+            f"--> [AUDIO] Estraggo audio da video: {url}",
             flush=True,
         )
 
-        video_clip = VideoFileClip(temp_download)
+        video_clip = None
 
-        if video_clip.audio is not None:
-            video_clip.audio.write_audiofile(
-                output_audio_path,
-                logger=None,
-                fps=44100,
+        try:
+            video_clip = VideoFileClip(
+                temp_download
             )
 
-        video_clip.close()
+            if video_clip.audio is not None:
+                video_clip.audio.write_audiofile(
+                    output_audio_path,
+                    logger=None,
+                    fps=44100,
+                )
 
-        if os.path.exists(temp_download):
-            os.remove(temp_download)
+        finally:
+            if video_clip is not None:
+                try:
+                    video_clip.close()
+                except Exception:
+                    pass
+
+            if os.path.exists(temp_download):
+                try:
+                    os.remove(temp_download)
+                except Exception:
+                    pass
 
     else:
+
         if os.path.exists(output_audio_path):
             os.remove(output_audio_path)
 
-        os.rename(temp_download, output_audio_path)
+        os.rename(
+            temp_download,
+            output_audio_path,
+        )
+
 
 # ============================================================
-# 7. COSTRUZIONE PROMPT
+# 9. COSTRUZIONE PROMPT ECCOMI
 # ============================================================
 
-def build_enhanced_prompt(prompt: str) -> str:
-    """
-    Prompt rinforzato:
-    - stessa identità del personaggio
-    - ma con movimento leggibile
-    - senza congelarlo troppo
-    """
+def build_enhanced_prompt(
+    prompt: str,
+) -> str:
+
     prompt = sanitize_text(prompt)
 
     base_suffix = (
-        " premium comic illustration, branded mascot animation, "
-        "same hero identity as the input image, same costume, same emblem, "
-        "stable face, stable hairstyle, stable body proportions, "
-        "visible but controlled arm motion, slight torso shift, "
-        "small natural head movement, subtle expression change, "
-        "gentle cape flow, clean professional quality, no extra arms, "
-        "no extra hands, no body distortion, no costume redesign"
+        "premium comic illustration, "
+        "professional branded mascot animation, "
+        "same character identity as the input image, "
+        "stable recognizable face, "
+        "stable hairstyle, "
+        "stable muscular body proportions, "
+        "stable costume and chest emblem, "
+        "one clear controlled gesture, "
+        "natural arm motion, "
+        "small coordinated shoulder movement, "
+        "subtle upper torso movement, "
+        "small natural head motion, "
+        "gentle cape movement, "
+        "smooth temporal consistency, "
+        "clean professional quality, "
+        "no character redesign, "
+        "no face morphing, "
+        "no costume morphing, "
+        "no extra arms, "
+        "no extra hands, "
+        "no extra fingers, "
+        "no extra legs, "
+        "no body distortion"
     )
 
-    return f"{prompt}, {base_suffix}"
+    return (
+        f"{prompt}, "
+        f"{base_suffix}"
+    )
+
 
 # ============================================================
-# 8. GENERAZIONE SINGOLA CLIP WAN
+# 10. GENERAZIONE SINGOLA CLIP WAN
 # ============================================================
 
 def generate_single_clip_wan(
@@ -399,21 +474,44 @@ def generate_single_clip_wan(
 ) -> str:
 
     print(
-        f"--> [WAN 2.1 ECCOMI] Genero scena: '{prompt}'",
+        "--> [WAN 2.1 ECCOMI] Generazione nuova scena...",
         flush=True,
     )
-
-    enhanced_prompt = build_enhanced_prompt(prompt)
-
-    torch.cuda.empty_cache()
-    gc.collect()
 
     print(
-        f"--> [WAN] Avvio inferenza 720P / {WAN_NUM_FRAMES} frames / {WAN_NUM_STEPS} steps...",
+        f"--> [PROMPT] {prompt}",
         flush=True,
     )
 
+    enhanced_prompt = build_enhanced_prompt(
+        prompt
+    )
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+
+    log_gpu_memory(
+        "Prima inferenza"
+    )
+
+    print(
+        f"--> [WAN] Avvio inferenza "
+        f"{TARGET_WIDTH}x{TARGET_HEIGHT} / "
+        f"{WAN_NUM_FRAMES} frames / "
+        f"{WAN_NUM_STEPS} steps / "
+        f"guidance {WAN_GUIDANCE_SCALE}...",
+        flush=True,
+    )
+
+    inference_start = time.perf_counter()
+
     with torch.inference_mode():
+
         result = pipe(
             image=image,
             prompt=enhanced_prompt,
@@ -424,97 +522,165 @@ def generate_single_clip_wan(
             guidance_scale=WAN_GUIDANCE_SCALE,
         )
 
+    inference_seconds = (
+        time.perf_counter()
+        - inference_start
+    )
+
     frames = result.frames[0]
 
     print(
-        "--> [WAN] Inferenza completata.",
+        f"✅ [WAN] Inferenza completata in "
+        f"{inference_seconds:.1f} secondi "
+        f"({inference_seconds / 60:.2f} minuti).",
         flush=True,
     )
 
-    temp_file = tempfile.NamedTemporaryFile(
-        suffix=".mp4",
-        delete=False,
+    log_gpu_memory(
+        "Dopo inferenza"
+    )
+
+    temp_video_path = make_temp_path(
+        ".mp4"
+    )
+
+    print(
+        f"--> [WAN] Export clip a {EXPORT_FPS} fps...",
+        flush=True,
     )
 
     export_to_video(
         frames,
-        temp_file.name,
+        temp_video_path,
         fps=EXPORT_FPS,
     )
 
-    torch.cuda.empty_cache()
-    gc.collect()
+    # Liberiamo esplicitamente i frame PIL
+    del frames
+    del result
 
-    return temp_file.name
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return temp_video_path
+
 
 # ============================================================
-# 9. HANDLER RUNPOD
+# 11. HANDLER RUNPOD
 # ============================================================
 
 def handler(event):
 
+    job_start = time.perf_counter()
+
     print(
-        "--- 🚀 Avvio Generazione Spot Pubblicitario ECCOMI con Wan 2.1 14B ---",
+        "--- 🚀 ECCOMI VIDEO MAKER "
+        "| WAN 2.1 14B "
+        "| FULL GPU 80GB ---",
         flush=True,
     )
 
-    job_input = event.get("input", {})
-    job_id = event.get("id", "test_job")
+    job_input = event.get(
+        "input",
+        {},
+    )
 
-    image_url = job_input.get("image_url")
-    voice_url = job_input.get("voice_audio_url")
-    music_url = job_input.get("music_audio_url")
+    job_id = event.get(
+        "id",
+        "test_job",
+    )
 
-    scenes_prompts = job_input.get("scenes_prompts", DEFAULT_SCENES)
+    image_url = job_input.get(
+        "image_url"
+    )
+
+    voice_url = job_input.get(
+        "voice_audio_url"
+    )
+
+    music_url = job_input.get(
+        "music_audio_url"
+    )
+
+    scenes_prompts = job_input.get(
+        "scenes_prompts",
+        DEFAULT_SCENES,
+    )
 
     if not image_url:
-        return {"error": "Nessuna image_url fornita."}
+        return {
+            "error": "Nessuna image_url fornita."
+        }
+
+    if (
+        not isinstance(scenes_prompts, list)
+        or len(scenes_prompts) == 0
+    ):
+        scenes_prompts = DEFAULT_SCENES
 
     generated_clip_paths = []
     temp_audio_files = []
     video_clips = []
-    final_video = None
+    audio_clips = []
+
+    output_spot_path = None
     final_video_base = None
+    final_video = None
+    final_audio = None
 
     try:
-        # ----------------------------------------------------
+
+        # ====================================================
         # DOWNLOAD IMMAGINE
-        # ----------------------------------------------------
+        # ====================================================
 
         print(
             "--> [INPUT] Download immagine...",
             flush=True,
         )
 
-        init_image = download_image(image_url)
+        init_image = download_image(
+            image_url
+        )
 
         print(
-            f"--> [INPUT] Immagine originale ricevuta: {init_image.width}x{init_image.height}",
+            f"--> [INPUT] Immagine ricevuta: "
+            f"{init_image.width}x{init_image.height}",
             flush=True,
         )
 
-        init_image = prepare_image_for_wan(init_image)
+        # NOTA:
+        # NON facciamo ImageOps.fit/crop.
+        # Manteniamo l'immagine originale e lasciamo
+        # il preprocessing alla pipeline Wan.
+        # Questo evita di tagliare ECCOMI MAN.
 
-        print(
-            f"--> [INPUT] Immagine adattata per Wan: {init_image.width}x{init_image.height}",
-            flush=True,
-        )
-
-        # ----------------------------------------------------
+        # ====================================================
         # GENERAZIONE SCENE
-        # ----------------------------------------------------
+        # ====================================================
 
-        if not isinstance(scenes_prompts, list) or len(scenes_prompts) == 0:
-            scenes_prompts = DEFAULT_SCENES
+        valid_prompts = []
 
-        for idx, scene_prompt in enumerate(scenes_prompts):
-            scene_prompt = sanitize_text(scene_prompt)
+        for scene_prompt in scenes_prompts:
+            clean_prompt = sanitize_text(
+                scene_prompt
+            )
 
-            if not scene_prompt:
-                continue
+            if clean_prompt:
+                valid_prompts.append(
+                    clean_prompt
+                )
+
+        if not valid_prompts:
+            valid_prompts = DEFAULT_SCENES
+
+        for idx, scene_prompt in enumerate(
+            valid_prompts
+        ):
 
             print(
-                f"--> Genero Scena {idx + 1}/{len(scenes_prompts)} con Wan 2.1...",
+                f"--> [SCENA] "
+                f"{idx + 1}/{len(valid_prompts)}",
                 flush=True,
             )
 
@@ -523,106 +689,155 @@ def handler(event):
                 scene_prompt,
             )
 
-            generated_clip_paths.append(clip_path)
+            generated_clip_paths.append(
+                clip_path
+            )
 
-        if len(generated_clip_paths) == 0:
-            return {"error": "Nessuna clip generata."}
+        if not generated_clip_paths:
+            raise RuntimeError(
+                "Nessuna clip generata."
+            )
 
-        # ----------------------------------------------------
-        # MONTAGGIO
-        # ----------------------------------------------------
+        # ====================================================
+        # MONTAGGIO VIDEO
+        # ====================================================
 
         print(
-            "--> [MONTAGGIO] Unione clip...",
+            "--> [MONTAGGIO] Apro clip generate...",
             flush=True,
         )
 
-        video_clips = [VideoFileClip(p) for p in generated_clip_paths]
+        for path in generated_clip_paths:
+            video_clips.append(
+                VideoFileClip(path)
+            )
 
         if len(video_clips) == 1:
+
             final_video_base = video_clips[0]
+
         else:
+
+            print(
+                "--> [MONTAGGIO] "
+                "Unione clip con crossfade...",
+                flush=True,
+            )
+
             final_video_base = concatenate_videoclips(
-                [clip.crossfadein(0.25) for clip in video_clips],
+                [
+                    clip.crossfadein(0.25)
+                    for clip in video_clips
+                ],
                 method="compose",
             )
 
-        audio_tracks = []
-
-        # ----------------------------------------------------
-        # VOCE
-        # ----------------------------------------------------
+        # ====================================================
+        # AUDIO VOCE
+        # ====================================================
 
         if voice_url:
-            voice_audio_path = tempfile.NamedTemporaryFile(
-                suffix=".mp3",
-                delete=False,
-            ).name
+
+            voice_audio_path = make_temp_path(
+                ".mp3"
+            )
 
             extract_or_download_audio(
                 voice_url,
                 voice_audio_path,
             )
 
-            if voice_audio_path and os.path.exists(voice_audio_path):
-                temp_audio_files.append(voice_audio_path)
-                voice_clip = AudioFileClip(voice_audio_path)
-                audio_tracks.append(voice_clip)
+            if os.path.exists(
+                voice_audio_path
+            ):
 
-        # ----------------------------------------------------
-        # MUSICA
-        # ----------------------------------------------------
+                temp_audio_files.append(
+                    voice_audio_path
+                )
+
+                voice_clip = AudioFileClip(
+                    voice_audio_path
+                )
+
+                audio_clips.append(
+                    voice_clip
+                )
+
+        # ====================================================
+        # AUDIO MUSICA
+        # ====================================================
 
         if music_url:
-            music_audio_path = tempfile.NamedTemporaryFile(
-                suffix=".mp3",
-                delete=False,
-            ).name
+
+            music_audio_path = make_temp_path(
+                ".mp3"
+            )
 
             extract_or_download_audio(
                 music_url,
                 music_audio_path,
             )
 
-            if music_audio_path and os.path.exists(music_audio_path):
-                temp_audio_files.append(music_audio_path)
+            if os.path.exists(
+                music_audio_path
+            ):
 
-                music_clip = (
-                    AudioFileClip(music_audio_path)
-                    .volumex(0.12)
-                    .set_duration(final_video_base.duration)
+                temp_audio_files.append(
+                    music_audio_path
                 )
 
-                audio_tracks.append(music_clip)
+                music_clip = (
+                    AudioFileClip(
+                        music_audio_path
+                    )
+                    .volumex(0.12)
+                    .set_duration(
+                        final_video_base.duration
+                    )
+                )
 
-        # ----------------------------------------------------
+                audio_clips.append(
+                    music_clip
+                )
+
+        # ====================================================
         # MIX AUDIO
-        # ----------------------------------------------------
+        # ====================================================
 
-        if audio_tracks:
+        if audio_clips:
+
             print(
-                "--> [AUDIO] Unione tracce audio...",
+                "--> [AUDIO] Mix tracce...",
                 flush=True,
             )
 
-            final_audio = CompositeAudioClip(audio_tracks)
-            final_video = final_video_base.set_audio(final_audio)
+            final_audio = CompositeAudioClip(
+                audio_clips
+            )
+
+            final_video = (
+                final_video_base
+                .set_audio(final_audio)
+            )
+
         else:
+
             final_video = final_video_base
 
-        # ----------------------------------------------------
-        # ESPORTAZIONE VIDEO
-        # ----------------------------------------------------
+        # ====================================================
+        # RENDER FINALE
+        # ====================================================
 
-        output_spot_path = tempfile.NamedTemporaryFile(
-            suffix=".mp4",
-            delete=False,
-        ).name
+        output_spot_path = make_temp_path(
+            ".mp4"
+        )
 
         print(
             "--> [RENDER] Rendering finale...",
             flush=True,
         )
+
+        render_start = time.perf_counter()
 
         final_video.write_videofile(
             output_spot_path,
@@ -637,22 +852,46 @@ def handler(event):
             ],
         )
 
-        # ----------------------------------------------------
-        # UPLOAD SUPABASE
-        # ----------------------------------------------------
+        render_seconds = (
+            time.perf_counter()
+            - render_start
+        )
 
         print(
-            "--> [UPLOAD] Caricamento spot su Supabase...",
+            f"✅ [RENDER] Completato in "
+            f"{render_seconds:.1f} secondi.",
             flush=True,
         )
 
-        safe_job_id = str(job_id).replace("/", "_")
-        object_path = f"{safe_job_id}_spot_wan21.mp4"
+        # ====================================================
+        # UPLOAD SUPABASE
+        # ====================================================
 
-        with open(output_spot_path, "rb") as f:
-            supabase.storage.from_("videos").upload(
+        print(
+            "--> [UPLOAD] Caricamento su Supabase...",
+            flush=True,
+        )
+
+        safe_job_id = (
+            str(job_id)
+            .replace("/", "_")
+            .replace("\\", "_")
+        )
+
+        object_path = (
+            f"{safe_job_id}_spot_wan21.mp4"
+        )
+
+        with open(
+            output_spot_path,
+            "rb",
+        ) as file_handle:
+
+            supabase.storage.from_(
+                "videos"
+            ).upload(
                 path=object_path,
-                file=f,
+                file=file_handle,
                 file_options={
                     "content-type": "video/mp4",
                     "upsert": "true",
@@ -660,7 +899,31 @@ def handler(event):
             )
 
         public_video_url = (
-            f"{BASE_SUPABASE_URL}/storage/v1/object/public/videos/{object_path}"
+            f"{BASE_SUPABASE_URL}"
+            f"/storage/v1/object/public/videos/"
+            f"{object_path}"
+        )
+
+        total_job_seconds = (
+            time.perf_counter()
+            - job_start
+        )
+
+        print(
+            "============================================",
+            flush=True,
+        )
+
+        print(
+            "✅ ECCOMI VIDEO COMPLETATO",
+            flush=True,
+        )
+
+        print(
+            f"✅ TEMPO TOTALE JOB: "
+            f"{total_job_seconds:.1f} sec "
+            f"({total_job_seconds / 60:.2f} min)",
+            flush=True,
         )
 
         print(
@@ -668,57 +931,154 @@ def handler(event):
             flush=True,
         )
 
-        return {"spot_url": public_video_url}
-
-    except Exception as e:
         print(
-            f"❌ Errore durante la creazione dello spot: {e}",
+            "============================================",
             flush=True,
         )
 
-        torch.cuda.empty_cache()
-        gc.collect()
+        return {
+            "spot_url": public_video_url,
+            "generation": {
+                "model": MODEL_ID,
+                "mode": "full_gpu_80gb",
+                "width": TARGET_WIDTH,
+                "height": TARGET_HEIGHT,
+                "frames": WAN_NUM_FRAMES,
+                "steps": WAN_NUM_STEPS,
+                "guidance_scale": WAN_GUIDANCE_SCALE,
+                "fps": EXPORT_FPS,
+                "total_seconds": round(
+                    total_job_seconds,
+                    2,
+                ),
+            },
+        }
 
-        return {"error": str(e)}
+    except torch.cuda.OutOfMemoryError as e:
+
+        print(
+            "❌ [CUDA OOM] Memoria GPU insufficiente.",
+            flush=True,
+        )
+
+        print(
+            str(e),
+            flush=True,
+        )
+
+        log_gpu_memory(
+            "CUDA OOM"
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return {
+            "error": "CUDA_OUT_OF_MEMORY",
+            "details": str(e),
+        }
+
+    except Exception as e:
+
+        print(
+            f"❌ [ERROR] {type(e).__name__}: {e}",
+            flush=True,
+        )
+
+        log_gpu_memory(
+            "Errore job"
+        )
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        return {
+            "error": str(e)
+        }
 
     finally:
-        # ----------------------------------------------------
-        # PULIZIA
-        # ----------------------------------------------------
+
+        # ====================================================
+        # CLEANUP MOVIEPY
+        # ====================================================
+
         try:
-            for clip in video_clips:
+
+            if final_audio is not None:
                 try:
-                    clip.close()
+                    final_audio.close()
                 except Exception:
                     pass
 
-            if final_video and final_video is not final_video_base:
+            for audio_clip in audio_clips:
+                try:
+                    audio_clip.close()
+                except Exception:
+                    pass
+
+            if (
+                final_video is not None
+                and final_video is not final_video_base
+            ):
                 try:
                     final_video.close()
                 except Exception:
                     pass
 
-            if final_video_base:
+            if (
+                final_video_base is not None
+                and final_video_base not in video_clips
+            ):
                 try:
                     final_video_base.close()
                 except Exception:
                     pass
 
-            for p in generated_clip_paths + temp_audio_files:
+            for video_clip in video_clips:
                 try:
-                    if p and os.path.exists(p):
-                        os.remove(p)
+                    video_clip.close()
                 except Exception:
                     pass
 
         except Exception:
             pass
 
-        torch.cuda.empty_cache()
+        # ====================================================
+        # CLEANUP FILE TEMPORANEI
+        # ====================================================
+
+        cleanup_paths = (
+            generated_clip_paths
+            + temp_audio_files
+        )
+
+        if output_spot_path:
+            cleanup_paths.append(
+                output_spot_path
+            )
+
+        for path in cleanup_paths:
+
+            try:
+                if (
+                    path
+                    and os.path.exists(path)
+                ):
+                    os.remove(path)
+
+            except Exception:
+                pass
+
         gc.collect()
+        torch.cuda.empty_cache()
+
+        log_gpu_memory(
+            "Fine job / cleanup"
+        )
+
 
 # ============================================================
-# 10. START RUNPOD SERVERLESS
+# 12. START RUNPOD SERVERLESS
 # ============================================================
 
 runpod.serverless.start(
