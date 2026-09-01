@@ -125,7 +125,7 @@ def generate_single_clip_wan(image: Image.Image, prompt: str) -> str:
         prompt=enhanced_prompt,
         height=720,                # Forza altezza standard HD (16:9)
         width=1280,                # Forza larghezza standard HD
-        num_frames=49,             # ~2 sec per scena
+        num_frames=33,             # ~2 sec per scena
         num_inference_steps=30,    # Bilanciamento perfetto qualità/velocità
         guidance_scale=5.0,        # Evita artefatti cromatici e saturazioni
     ).frames[0]
