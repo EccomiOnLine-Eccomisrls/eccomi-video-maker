@@ -112,8 +112,9 @@ def generate_single_clip_wan(image: Image.Image, prompt: str) -> str:
     print(f"--> [WAN 2.1 CINEMATIC] Genero scena: '{prompt}'", flush=True)
     
     enhanced_prompt = (
-        f"{prompt}, 8k resolution, photorealistic, cinematic lighting, "
-        f"dynamic camera movement, 35mm film shot, smooth physics, masterpiece"
+        f"{prompt}, premium comic illustration, branded mascot animation, "
+        f"consistent character identity, stable face, stable body proportions, "
+        f"stable costume details, smooth subtle motion, clean professional quality"
     )
 
     torch.cuda.empty_cache()
