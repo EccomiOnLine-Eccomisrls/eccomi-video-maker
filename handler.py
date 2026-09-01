@@ -36,27 +36,78 @@ print(
 )
 
 try:
-    from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+    from diffusers import (
+        AutoencoderKLWan,
+        WanTransformer3DModel,
+        WanImageToVideoPipeline,
+    )
+    from diffusers.hooks import apply_group_offloading
     from diffusers.utils import export_to_video
+    from transformers import UMT5EncoderModel, CLIPVisionModel
 
     model_id = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 
-    # Carica VAE in float32 e la pipeline in bfloat16
-    vae = AutoencoderKLWan.from_pretrained(
-        model_id, subfolder="vae", torch_dtype=torch.float32
-    )
-    pipe = WanImageToVideoPipeline.from_pretrained(
-        model_id, vae=vae, torch_dtype=torch.bfloat16
+    print("--> [MODEL] Caricamento componenti Wan 2.1 14B con Group Offloading...", flush=True)
+
+    # Componenti
+    image_encoder = CLIPVisionModel.from_pretrained(
+        model_id,
+        subfolder="image_encoder",
+        torch_dtype=torch.float32,
     )
 
-    # OTTIMIZZAZIONE VRAM FONDAMENTALE (Evita OOM su GPU 48GB)
-    if hasattr(pipe, "enable_model_cpu_offload"):
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe.to("cuda")
+    text_encoder = UMT5EncoderModel.from_pretrained(
+        model_id,
+        subfolder="text_encoder",
+        torch_dtype=torch.bfloat16,
+    )
+
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id,
+        subfolder="vae",
+        torch_dtype=torch.float32,
+    )
+
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+    )
+
+    onload_device = torch.device("cuda")
+    offload_device = torch.device("cpu")
+
+    # Text encoder: group offload
+    apply_group_offloading(
+        text_encoder,
+        onload_device=onload_device,
+        offload_device=offload_device,
+        offload_type="block_level",
+        num_blocks_per_group=4,
+    )
+
+    # Transformer: group offload + CUDA streams
+    transformer.enable_group_offload(
+        onload_device=onload_device,
+        offload_device=offload_device,
+        offload_type="leaf_level",
+        use_stream=False,
+    )
+
+    pipe = WanImageToVideoPipeline.from_pretrained(
+        model_id,
+        vae=vae,
+        transformer=transformer,
+        text_encoder=text_encoder,
+        image_encoder=image_encoder,
+        torch_dtype=torch.bfloat16,
+    )
+
+    # Gli elementi più pesanti sono già gestiti dal group offload
+    pipe.to("cuda")
 
     print(
-        "--> [MODEL] Wan 2.1 14B 720P Caricato ed Ottimizzato con successo!",
+        "--> [MODEL] Wan 2.1 14B 720P + GROUP OFFLOAD caricato con successo!",
         flush=True,
     )
 
