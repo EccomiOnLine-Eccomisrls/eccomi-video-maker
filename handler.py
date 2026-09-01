@@ -83,20 +83,24 @@ EXPORT_FPS = 24
 DEFAULT_SCENES = [
     (
         "ECCOMI MAN, the exact official illustrated superhero mascot "
-        "from the reference image, confidently presenting the new "
-        "ECCOMI ONLINE website. "
-        "He performs one clear and controlled presenting gesture: "
-        "his open presenting arm moves smoothly outward and slightly upward, "
-        "his hand turns naturally toward the viewer, "
-        "his head makes a small natural turn and returns toward the viewer, "
-        "and his shoulders and upper torso shift subtly with the gesture. "
-        "His red cape moves gently behind him. "
-        "The movement must be clearly visible, smooth and professional. "
-        "Preserve his face, hairstyle, body proportions, costume, "
-        "red cape, red belt, gloves, boots and chest emblem. "
-        "Keep both feet fixed. "
-        "Fixed camera. No zoom. No scene change. "
-        "No morphing. No extra fingers. No extra limbs."
+        "from the reference image. "
+        "ONLY ONE MOTION IS ALLOWED. "
+        "The arm already extended on the RIGHT SIDE OF THE IMAGE, "
+        "viewer's right, slowly and continuously extends slightly farther "
+        "outward and slightly upward from the first frame until the final frame. "
+        "The motion must be clearly visible but elegant and controlled. "
+        "Do not return the presenting arm to its starting position. "
+        "The hand resting on the hip on the LEFT SIDE OF THE IMAGE, "
+        "viewer's left, must remain completely frozen and attached to the hip "
+        "from first frame to last frame. "
+        "The head, face, shoulders, torso, waist, legs, feet and red cape "
+        "must remain completely still. "
+        "Fixed camera. No zoom. No camera movement. No walking. "
+        "No second-arm movement. No pose change. No cape movement. "
+        "No head movement. No torso movement. "
+        "Preserve exactly his face, hairstyle, body proportions, costume, "
+        "chest emblem, gloves, boots and cape. "
+        "No morphing. No extra fingers. No extra hands. No extra limbs."
     )
 ]
 
@@ -432,6 +436,15 @@ def build_enhanced_prompt(
 
     prompt = sanitize_text(prompt)
 
+    # --------------------------------------------------------
+    # SUFFIX NEUTRO
+    #
+    # IMPORTANTE:
+    # qui NON diamo più istruzioni di movimento.
+    # Il movimento deve essere deciso esclusivamente
+    # dal prompt della singola scena.
+    # --------------------------------------------------------
+
     base_suffix = (
         "premium comic illustration, "
         "professional branded mascot animation, "
@@ -440,12 +453,6 @@ def build_enhanced_prompt(
         "stable hairstyle, "
         "stable muscular body proportions, "
         "stable costume and chest emblem, "
-        "one clear controlled gesture, "
-        "natural arm motion, "
-        "small coordinated shoulder movement, "
-        "subtle upper torso movement, "
-        "small natural head motion, "
-        "gentle cape movement, "
         "smooth temporal consistency, "
         "clean professional quality, "
         "no character redesign, "
@@ -485,6 +492,11 @@ def generate_single_clip_wan(
 
     enhanced_prompt = build_enhanced_prompt(
         prompt
+    )
+    
+    print(
+        f"--> [PROMPT FINALE WAN] {enhanced_prompt}",
+        flush=True,
     )
 
     gc.collect()
