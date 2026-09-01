@@ -74,7 +74,7 @@ TARGET_HEIGHT = 720
 # per confrontare correttamente velocità e costo.
 # ------------------------------------------------------------
 
-WAN_NUM_FRAMES = 33
+WAN_NUM_FRAMES = 49
 WAN_NUM_STEPS = 30
 WAN_GUIDANCE_SCALE = 5.0
 EXPORT_FPS = 24
