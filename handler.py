@@ -70,10 +70,17 @@ try:
     model_id = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 
     print(
-        "--> [MODEL] Caricamento componenti Wan 2.1 14B "
-        "con Group + Disk Offloading...",
+        "--> [MODEL] Caricamento Wan 2.1 14B "
+        "con SEQUENTIAL GROUP + DISK OFFLOADING...",
         flush=True,
     )
+
+    # --------------------------------------------------------
+    # DEVICE
+    # --------------------------------------------------------
+
+    onload_device = torch.device("cuda")
+    offload_device = torch.device("cpu")
 
     # --------------------------------------------------------
     # DIRECTORY DI OFFLOAD SU DISCO
@@ -106,12 +113,12 @@ try:
         flush=True,
     )
 
-    # --------------------------------------------------------
-    # IMAGE ENCODER
-    # --------------------------------------------------------
+    # ========================================================
+    # STEP 1 — IMAGE ENCODER
+    # ========================================================
 
     print(
-        "--> [MODEL] Carico CLIP Image Encoder...",
+        "--> [MODEL 1/4] Carico CLIP Image Encoder...",
         flush=True,
     )
 
@@ -121,12 +128,20 @@ try:
         torch_dtype=torch.float32,
     )
 
-    # --------------------------------------------------------
-    # TEXT ENCODER
-    # --------------------------------------------------------
+    print(
+        "--> [MODEL 1/4] CLIP Image Encoder caricato.",
+        flush=True,
+    )
+
+    gc.collect()
+
+    # ========================================================
+    # STEP 2 — TEXT ENCODER
+    # Carichiamo e OFFLOADIAMO SUBITO, prima del Transformer.
+    # ========================================================
 
     print(
-        "--> [MODEL] Carico UMT5 Text Encoder...",
+        "--> [MODEL 2/4] Carico UMT5 Text Encoder...",
         flush=True,
     )
 
@@ -136,50 +151,9 @@ try:
         torch_dtype=torch.bfloat16,
     )
 
-    # --------------------------------------------------------
-    # VAE
-    # --------------------------------------------------------
-
     print(
-        "--> [MODEL] Carico Wan VAE...",
-        flush=True,
-    )
-
-    vae = AutoencoderKLWan.from_pretrained(
-        model_id,
-        subfolder="vae",
-        torch_dtype=torch.float32,
-    )
-
-    # --------------------------------------------------------
-    # TRANSFORMER
-    # --------------------------------------------------------
-
-    print(
-        "--> [MODEL] Carico Wan Transformer 14B...",
-        flush=True,
-    )
-
-    transformer = WanTransformer3DModel.from_pretrained(
-        model_id,
-        subfolder="transformer",
-        torch_dtype=torch.bfloat16,
-    )
-
-    # --------------------------------------------------------
-    # DEVICE
-    # --------------------------------------------------------
-
-    onload_device = torch.device("cuda")
-    offload_device = torch.device("cpu")
-
-    # --------------------------------------------------------
-    # TEXT ENCODER:
-    # GROUP OFFLOAD + DISK OFFLOAD
-    # --------------------------------------------------------
-
-    print(
-        "--> [OFFLOAD] Configuro Text Encoder...",
+        "--> [OFFLOAD 1/2] "
+        "Configuro IMMEDIATAMENTE Text Encoder su disco...",
         flush=True,
     )
 
@@ -193,13 +167,62 @@ try:
         offload_to_disk_path=text_offload_path,
     )
 
-    # --------------------------------------------------------
-    # TRANSFORMER:
-    # LEAF GROUP OFFLOAD + DISK OFFLOAD
-    # --------------------------------------------------------
+    print(
+        "--> [OFFLOAD 1/2] Text Encoder configurato con successo.",
+        flush=True,
+    )
+
+    # Liberazione memoria PRIMA di caricare VAE e Transformer
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # ========================================================
+    # STEP 3 — VAE
+    # ========================================================
 
     print(
-        "--> [OFFLOAD] Configuro Transformer...",
+        "--> [MODEL 3/4] Carico Wan VAE...",
+        flush=True,
+    )
+
+    vae = AutoencoderKLWan.from_pretrained(
+        model_id,
+        subfolder="vae",
+        torch_dtype=torch.float32,
+    )
+
+    print(
+        "--> [MODEL 3/4] Wan VAE caricato.",
+        flush=True,
+    )
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # ========================================================
+    # STEP 4 — TRANSFORMER 14B
+    #
+    # IMPORTANTE:
+    # Il Text Encoder è già sotto Group/Disk Offload.
+    # Non abbiamo più Text Encoder + Transformer 14B
+    # entrambi completamente residenti in RAM prima
+    # dell'applicazione dell'offload.
+    # ========================================================
+
+    print(
+        "--> [MODEL 4/4] Carico Wan Transformer 14B...",
+        flush=True,
+    )
+
+    transformer = WanTransformer3DModel.from_pretrained(
+        model_id,
+        subfolder="transformer",
+        torch_dtype=torch.bfloat16,
+    )
+
+    print(
+        "--> [OFFLOAD 2/2] "
+        "Configuro IMMEDIATAMENTE Transformer su disco...",
         flush=True,
     )
 
@@ -211,9 +234,17 @@ try:
         offload_to_disk_path=transformer_offload_path,
     )
 
-    # --------------------------------------------------------
-    # PIPELINE
-    # --------------------------------------------------------
+    print(
+        "--> [OFFLOAD 2/2] Transformer configurato con successo.",
+        flush=True,
+    )
+
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # ========================================================
+    # CREAZIONE PIPELINE
+    # ========================================================
 
     print(
         "--> [MODEL] Creo Wan Image-To-Video Pipeline...",
@@ -229,17 +260,20 @@ try:
         torch_dtype=torch.bfloat16,
     )
 
-    # Pipeline su CUDA.
-    # I moduli sottoposti a group offload vengono gestiti
-    # automaticamente dagli hook di Diffusers.
+    # Manteniamo il comportamento della release che
+    # è già riuscita a completare un video.
+    #
+    # Diffusers può mostrare un warning sui moduli già
+    # group-offloaded: gli hook continueranno comunque
+    # a gestire Text Encoder e Transformer.
     pipe.to("cuda")
 
     torch.cuda.empty_cache()
     gc.collect()
 
     print(
-        "--> [MODEL] Wan 2.1 14B 720P + GROUP/DISK OFFLOAD "
-        "caricato con successo!",
+        "--> [MODEL] Wan 2.1 14B 720P + "
+        "SEQUENTIAL GROUP/DISK OFFLOAD caricato con successo!",
         flush=True,
     )
 
@@ -381,10 +415,7 @@ def generate_single_clip_wan(
     )
 
     # Prompt automatico specifico per mascotte illustrate ECCOMI.
-    # Rimosso il precedente:
-    # photorealistic / dynamic camera / 35mm
-    # perché induceva trasformazioni indesiderate.
-
+    # Manteniamo il preset già validato tecnicamente.
     enhanced_prompt = (
         f"{prompt}, "
         f"premium comic illustration, "
