@@ -26,7 +26,7 @@ from moviepy.editor import (
 
 print(
     "--> [INIT] Avvio handler.py "
-    "(Wan 2.1 14B - 80GB FULL GPU MODE)...",
+    "(Wan 2.1 14B - 80GB FULL GPU MODE + AUTO DELIVERY)...",
     flush=True,
 )
 
@@ -47,9 +47,45 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
 BASE_SUPABASE_URL = SUPABASE_URL.rstrip("/")
 
+# ------------------------------------------------------------
+# AUTO DELIVERY
+#
+# EVS_CALLBACK_URL:
+# URL opzionale a cui inviare automaticamente il risultato
+# quando il video Ã¨ pronto.
+#
+# PuÃ² anche essere passato per singolo job tramite:
+# input.callback_url
+#
+# EVS_CALLBACK_TOKEN:
+# token opzionale salvato come secret/env RunPod.
+# Se presente viene inviato come:
+# Authorization: Bearer <token>
+# ------------------------------------------------------------
+
+DEFAULT_EVS_CALLBACK_URL = (
+    f"{BASE_SUPABASE_URL}/functions/v1/evs-video-callback"
+    if BASE_SUPABASE_URL
+    else ""
+)
+
+EVS_CALLBACK_URL = os.environ.get(
+    "EVS_CALLBACK_URL",
+    DEFAULT_EVS_CALLBACK_URL,
+).strip()
+
+EVS_CALLBACK_TOKEN = os.environ.get(
+    "EVS_CALLBACK_TOKEN",
+    "",
+).strip()
+
+CALLBACK_TIMEOUT_SECONDS = 20
+CALLBACK_MAX_ATTEMPTS = 3
+
+
 if not BASE_SUPABASE_URL or not SUPABASE_KEY:
     print(
-        "⚠️ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate!",
+        "â ï¸ WARNING: SUPABASE_URL o SUPABASE_KEY non impostate!",
         flush=True,
     )
 
@@ -67,12 +103,6 @@ MODEL_ID = "Wan-AI/Wan2.1-I2V-14B-720P-Diffusers"
 
 TARGET_WIDTH = 1280
 TARGET_HEIGHT = 720
-
-# ------------------------------------------------------------
-# BENCHMARK:
-# manteniamo gli stessi parametri usati sulla A40
-# per confrontare correttamente velocità e costo.
-# ------------------------------------------------------------
 
 WAN_NUM_FRAMES = 49
 WAN_NUM_STEPS = 30
@@ -118,7 +148,6 @@ def log_gpu_memory(stage: str):
         return
 
     device_index = torch.cuda.current_device()
-
     props = torch.cuda.get_device_properties(device_index)
 
     total_gb = props.total_memory / (1024 ** 3)
@@ -161,7 +190,7 @@ if not torch.cuda.is_available():
 
 
 print(
-    "--> [MODEL] Modalità FULL GPU 80GB.",
+    "--> [MODEL] ModalitÃ  FULL GPU 80GB.",
     flush=True,
 )
 
@@ -190,30 +219,12 @@ try:
 
     log_gpu_memory("Prima del caricamento modello")
 
-    # --------------------------------------------------------
-    # FULL GPU LOAD
-    #
-    # device_map='cuda':
-    # i componenti vengono caricati direttamente sulla GPU.
-    #
-    # low_cpu_mem_usage=True:
-    # riduce il picco RAM durante il caricamento.
-    # --------------------------------------------------------
-
     pipe = WanImageToVideoPipeline.from_pretrained(
         MODEL_ID,
         torch_dtype=torch.bfloat16,
         device_map="cuda",
         low_cpu_mem_usage=True,
     )
-
-    # --------------------------------------------------------
-    # VAE TILING / SLICING
-    #
-    # Manteniamo queste protezioni perché possono ridurre
-    # i picchi durante encoding/decoding senza ricorrere
-    # al disk offload.
-    # --------------------------------------------------------
 
     if hasattr(pipe, "enable_vae_slicing"):
         try:
@@ -241,9 +252,6 @@ try:
                 flush=True,
             )
 
-    # Il model card ufficiale mostra anche pipe.to("cuda").
-    # Con device_map="cuda" dovrebbe essere già su GPU,
-    # ma lo lasciamo come verifica esplicita.
     pipe.to("cuda")
 
     torch.cuda.empty_cache()
@@ -254,7 +262,7 @@ try:
     )
 
     print(
-        f"✅ [MODEL] Wan 2.1 14B FULL GPU caricato "
+        f"â [MODEL] Wan 2.1 14B FULL GPU caricato "
         f"in {model_load_seconds:.1f} secondi.",
         flush=True,
     )
@@ -263,7 +271,7 @@ try:
 
 except Exception as e:
     print(
-        "❌ [MODEL] ERRORE caricamento Wan FULL GPU:",
+        "â [MODEL] ERRORE caricamento Wan FULL GPU:",
         flush=True,
     )
 
@@ -272,11 +280,6 @@ except Exception as e:
         flush=True,
     )
 
-    # IMPORTANTE:
-    # niente fallback automatico a CogVideoX o disk offload.
-    #
-    # Per questo benchmark vogliamo sapere chiaramente
-    # se Wan 14B entra oppure no nella GPU 80GB.
     raise
 
 
@@ -305,8 +308,140 @@ def make_temp_path(suffix: str) -> str:
     return path
 
 
+def sanitize_job_id(value) -> str:
+    return (
+        str(value)
+        .replace("/", "_")
+        .replace("\\", "_")
+    )
+
+
 # ============================================================
-# 6. DOWNLOAD IMMAGINE
+# 6. AUTO DELIVERY / CALLBACK
+# ============================================================
+
+def send_delivery_callback(
+    callback_url: str,
+    payload: dict,
+) -> dict:
+
+    callback_url = sanitize_text(
+        callback_url
+    )
+
+    if not callback_url:
+        print(
+            "--> [DELIVERY] Nessun callback_url configurato. "
+            "Il risultato resta disponibile nell'output RunPod.",
+            flush=True,
+        )
+
+        return {
+            "enabled": False,
+            "delivered": False,
+            "status": "SKIPPED",
+        }
+
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": "EVS-PRO-RunPod/1.0",
+    }
+
+    callback_token = (
+        EVS_CALLBACK_TOKEN
+        or SUPABASE_KEY
+    )
+
+    if callback_token:
+        headers["Authorization"] = (
+            f"Bearer {callback_token}"
+        )
+
+    if SUPABASE_KEY:
+        headers["apikey"] = SUPABASE_KEY
+
+    last_error = None
+
+    print(
+        f"--> [DELIVERY] Invio callback a: {callback_url}",
+        flush=True,
+    )
+
+    for attempt in range(
+        1,
+        CALLBACK_MAX_ATTEMPTS + 1,
+    ):
+
+        try:
+            response = requests.post(
+                callback_url,
+                json=payload,
+                headers=headers,
+                timeout=CALLBACK_TIMEOUT_SECONDS,
+            )
+
+            if 200 <= response.status_code < 300:
+                print(
+                    f"â [DELIVERY] Callback consegnato "
+                    f"(HTTP {response.status_code}) "
+                    f"tentativo {attempt}/{CALLBACK_MAX_ATTEMPTS}.",
+                    flush=True,
+                )
+
+                return {
+                    "enabled": True,
+                    "delivered": True,
+                    "status": "DELIVERED",
+                    "http_status": response.status_code,
+                    "attempts": attempt,
+                }
+
+            last_error = (
+                f"HTTP {response.status_code}: "
+                f"{response.text[:500]}"
+            )
+
+            print(
+                f"â ï¸ [DELIVERY] Tentativo {attempt} fallito: "
+                f"{last_error}",
+                flush=True,
+            )
+
+        except Exception as e:
+            last_error = str(e)
+
+            print(
+                f"â ï¸ [DELIVERY] Tentativo {attempt} fallito: "
+                f"{last_error}",
+                flush=True,
+            )
+
+        if attempt < CALLBACK_MAX_ATTEMPTS:
+            time.sleep(
+                min(
+                    2 ** (attempt - 1),
+                    4,
+                )
+            )
+
+    print(
+        f"â [DELIVERY] Callback non consegnato dopo "
+        f"{CALLBACK_MAX_ATTEMPTS} tentativi. "
+        f"Errore: {last_error}",
+        flush=True,
+    )
+
+    return {
+        "enabled": True,
+        "delivered": False,
+        "status": "FAILED",
+        "attempts": CALLBACK_MAX_ATTEMPTS,
+        "error": last_error,
+    }
+
+
+# ============================================================
+# 7. DOWNLOAD IMMAGINE
 # ============================================================
 
 def download_image(url: str) -> Image.Image:
@@ -325,7 +460,7 @@ def download_image(url: str) -> Image.Image:
 
 
 # ============================================================
-# 7. DOWNLOAD FILE
+# 8. DOWNLOAD FILE
 # ============================================================
 
 def download_file(
@@ -347,7 +482,7 @@ def download_file(
 
 
 # ============================================================
-# 8. AUDIO
+# 9. AUDIO
 # ============================================================
 
 def extract_or_download_audio(
@@ -427,7 +562,7 @@ def extract_or_download_audio(
 
 
 # ============================================================
-# 9. COSTRUZIONE PROMPT ECCOMI
+# 10. COSTRUZIONE PROMPT ECCOMI
 # ============================================================
 
 def build_enhanced_prompt(
@@ -435,15 +570,6 @@ def build_enhanced_prompt(
 ) -> str:
 
     prompt = sanitize_text(prompt)
-
-    # --------------------------------------------------------
-    # SUFFIX NEUTRO
-    #
-    # IMPORTANTE:
-    # qui NON diamo più istruzioni di movimento.
-    # Il movimento deve essere deciso esclusivamente
-    # dal prompt della singola scena.
-    # --------------------------------------------------------
 
     base_suffix = (
         "premium comic illustration, "
@@ -472,7 +598,7 @@ def build_enhanced_prompt(
 
 
 # ============================================================
-# 10. GENERAZIONE SINGOLA CLIP WAN
+# 11. GENERAZIONE SINGOLA CLIP WAN
 # ============================================================
 
 def generate_single_clip_wan(
@@ -493,7 +619,7 @@ def generate_single_clip_wan(
     enhanced_prompt = build_enhanced_prompt(
         prompt
     )
-    
+
     print(
         f"--> [PROMPT FINALE WAN] {enhanced_prompt}",
         flush=True,
@@ -542,7 +668,7 @@ def generate_single_clip_wan(
     frames = result.frames[0]
 
     print(
-        f"✅ [WAN] Inferenza completata in "
+        f"â [WAN] Inferenza completata in "
         f"{inference_seconds:.1f} secondi "
         f"({inference_seconds / 60:.2f} minuti).",
         flush=True,
@@ -567,7 +693,6 @@ def generate_single_clip_wan(
         fps=EXPORT_FPS,
     )
 
-    # Liberiamo esplicitamente i frame PIL
     del frames
     del result
 
@@ -578,7 +703,7 @@ def generate_single_clip_wan(
 
 
 # ============================================================
-# 11. HANDLER RUNPOD
+# 12. HANDLER RUNPOD
 # ============================================================
 
 def handler(event):
@@ -586,9 +711,10 @@ def handler(event):
     job_start = time.perf_counter()
 
     print(
-        "--- 🚀 ECCOMI VIDEO MAKER "
+        "--- ð ECCOMI VIDEO MAKER "
         "| WAN 2.1 14B "
-        "| FULL GPU 80GB ---",
+        "| FULL GPU 80GB "
+        "| AUTO DELIVERY ---",
         flush=True,
     )
 
@@ -619,9 +745,46 @@ def handler(event):
         DEFAULT_SCENES,
     )
 
+    # --------------------------------------------------------
+    # AUTO DELIVERY:
+    # prioritÃ  a callback_url del singolo job;
+    # altrimenti usa EVS_CALLBACK_URL configurato come env.
+    # --------------------------------------------------------
+
+    callback_url = sanitize_text(
+        job_input.get(
+            "callback_url"
+        )
+        or EVS_CALLBACK_URL
+    )
+
+    # Riferimento opzionale dell'ordine/cliente.
+    # Utile per associare il callback al record corretto
+    # nel gestionale EVS PRO.
+    customer_reference = sanitize_text(
+        job_input.get(
+            "customer_reference"
+        )
+    )
+
     if not image_url:
+
+        error_payload = {
+            "event": "evs.video.failed",
+            "status": "FAILED",
+            "job_id": str(job_id),
+            "customer_reference": customer_reference or None,
+            "error": "Nessuna image_url fornita.",
+        }
+
+        delivery = send_delivery_callback(
+            callback_url,
+            error_payload,
+        )
+
         return {
-            "error": "Nessuna image_url fornita."
+            **error_payload,
+            "delivery": delivery,
         }
 
     if (
@@ -660,12 +823,6 @@ def handler(event):
             f"{init_image.width}x{init_image.height}",
             flush=True,
         )
-
-        # NOTA:
-        # NON facciamo ImageOps.fit/crop.
-        # Manteniamo l'immagine originale e lasciamo
-        # il preprocessing alla pipeline Wan.
-        # Questo evita di tagliare ECCOMI MAN.
 
         # ====================================================
         # GENERAZIONE SCENE
@@ -870,7 +1027,7 @@ def handler(event):
         )
 
         print(
-            f"✅ [RENDER] Completato in "
+            f"â [RENDER] Completato in "
             f"{render_seconds:.1f} secondi.",
             flush=True,
         )
@@ -884,10 +1041,8 @@ def handler(event):
             flush=True,
         )
 
-        safe_job_id = (
-            str(job_id)
-            .replace("/", "_")
-            .replace("\\", "_")
+        safe_job_id = sanitize_job_id(
+            job_id
         )
 
         object_path = (
@@ -921,25 +1076,41 @@ def handler(event):
             - job_start
         )
 
+        generation_info = {
+            "model": MODEL_ID,
+            "mode": "full_gpu_80gb",
+            "width": TARGET_WIDTH,
+            "height": TARGET_HEIGHT,
+            "frames": WAN_NUM_FRAMES,
+            "steps": WAN_NUM_STEPS,
+            "guidance_scale": WAN_GUIDANCE_SCALE,
+            "fps": EXPORT_FPS,
+            "scene_count": len(valid_prompts),
+            "total_seconds": round(
+                total_job_seconds,
+                2,
+            ),
+        }
+
         print(
             "============================================",
             flush=True,
         )
 
         print(
-            "✅ ECCOMI VIDEO COMPLETATO",
+            "â ECCOMI VIDEO COMPLETATO",
             flush=True,
         )
 
         print(
-            f"✅ TEMPO TOTALE JOB: "
+            f"â TEMPO TOTALE JOB: "
             f"{total_job_seconds:.1f} sec "
             f"({total_job_seconds / 60:.2f} min)",
             flush=True,
         )
 
         print(
-            f"✅ URL VIDEO: {public_video_url}",
+            f"â URL VIDEO: {public_video_url}",
             flush=True,
         )
 
@@ -948,28 +1119,37 @@ def handler(event):
             flush=True,
         )
 
-        return {
+        # ====================================================
+        # AUTO DELIVERY DEL LINK
+        # ====================================================
+
+        callback_payload = {
+            "event": "evs.video.completed",
+            "status": "COMPLETED",
+            "job_id": str(job_id),
+            "customer_reference": customer_reference or None,
             "spot_url": public_video_url,
-            "generation": {
-                "model": MODEL_ID,
-                "mode": "full_gpu_80gb",
-                "width": TARGET_WIDTH,
-                "height": TARGET_HEIGHT,
-                "frames": WAN_NUM_FRAMES,
-                "steps": WAN_NUM_STEPS,
-                "guidance_scale": WAN_GUIDANCE_SCALE,
-                "fps": EXPORT_FPS,
-                "total_seconds": round(
-                    total_job_seconds,
-                    2,
-                ),
-            },
+            "generation": generation_info,
+        }
+
+        delivery = send_delivery_callback(
+            callback_url,
+            callback_payload,
+        )
+
+        return {
+            "status": "COMPLETED",
+            "job_id": str(job_id),
+            "customer_reference": customer_reference or None,
+            "spot_url": public_video_url,
+            "generation": generation_info,
+            "delivery": delivery,
         }
 
     except torch.cuda.OutOfMemoryError as e:
 
         print(
-            "❌ [CUDA OOM] Memoria GPU insufficiente.",
+            "â [CUDA OOM] Memoria GPU insufficiente.",
             flush=True,
         )
 
@@ -985,15 +1165,29 @@ def handler(event):
         gc.collect()
         torch.cuda.empty_cache()
 
-        return {
+        error_payload = {
+            "event": "evs.video.failed",
+            "status": "FAILED",
+            "job_id": str(job_id),
+            "customer_reference": customer_reference or None,
             "error": "CUDA_OUT_OF_MEMORY",
             "details": str(e),
+        }
+
+        delivery = send_delivery_callback(
+            callback_url,
+            error_payload,
+        )
+
+        return {
+            **error_payload,
+            "delivery": delivery,
         }
 
     except Exception as e:
 
         print(
-            f"❌ [ERROR] {type(e).__name__}: {e}",
+            f"â [ERROR] {type(e).__name__}: {e}",
             flush=True,
         )
 
@@ -1004,8 +1198,22 @@ def handler(event):
         gc.collect()
         torch.cuda.empty_cache()
 
+        error_payload = {
+            "event": "evs.video.failed",
+            "status": "FAILED",
+            "job_id": str(job_id),
+            "customer_reference": customer_reference or None,
+            "error": str(e),
+        }
+
+        delivery = send_delivery_callback(
+            callback_url,
+            error_payload,
+        )
+
         return {
-            "error": str(e)
+            **error_payload,
+            "delivery": delivery,
         }
 
     finally:
@@ -1090,7 +1298,7 @@ def handler(event):
 
 
 # ============================================================
-# 12. START RUNPOD SERVERLESS
+# 13. START RUNPOD SERVERLESS
 # ============================================================
 
 runpod.serverless.start(
