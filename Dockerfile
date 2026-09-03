@@ -1,29 +1,27 @@
 # Immagine ufficiale RunPod ottimizzata per AI e GPU Nvidia
-FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04 
+FROM runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04
 
-# Imposta la cartella di lavoro su /app
 WORKDIR /app
-
-# Disabilita il buffering dell'output Python per vedere i log immediatamente
 ENV PYTHONUNBUFFERED=1
 
-# Installa le dipendenze di sistema necessarie per immagini, video e audio (FFmpeg)
+# Dipendenze di sistema per immagini, video e audio.
+# I font DejaVu servono al compositor deterministico di logo/CTA/testi.
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libsndfile1 \
     libjpeg-dev \
     libpng-dev \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
-# AGGIORNAMENTO Torch: Rende PyTorch compatibile con diffusers 0.33+ per evitare errori xpu/CUDA
+# Torch compatibile con diffusers 0.33+
 RUN pip install --no-cache-dir --upgrade torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
 
-# Copia e installa i requisiti Python
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copia lo script handler
-COPY handler.py .
+# Manteniamo il vecchio handler nel repository come rollback,
+# ma l'immagine commerciale usa il nuovo worker.
+COPY handler_commercial.py .
 
-# Comando per avviare il server in ascolto
-CMD [ "python", "-u", "handler.py" ]
+CMD [ "python", "-u", "handler_commercial.py" ]
