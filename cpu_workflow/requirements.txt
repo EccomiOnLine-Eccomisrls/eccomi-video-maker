@@ -1,0 +1,4 @@
+render>=0.7.0
+requests>=2.32.0
+imageio-ffmpeg>=0.6.0
+supabase>=2.18.0
