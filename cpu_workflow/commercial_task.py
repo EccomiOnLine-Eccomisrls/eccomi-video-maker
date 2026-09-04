@@ -12,7 +12,7 @@ from render import Retry, TaskContext
 from supabase import create_client
 
 OUT_W, OUT_H, FPS = 1080, 1920, 30
-COMMERCIAL_PROTOCOL = "EVS_COMMERCIAL_PRODUCT_SERVICE_V1"
+COMMERCIAL_PROTOCOL = "EVS_COMMERCIAL_PRODUCT_SERVICE_V2"
 FONT_REGULAR = [
     "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
@@ -51,6 +51,24 @@ def _fit(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     out = img.copy().convert("RGBA")
     out.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
     return out
+
+
+def _focus_crop(img: Image.Image, position: str = "middle", target_ratio: float = 0.82) -> Image.Image:
+    """Crop long screenshots to a readable detail while leaving normal product images untouched."""
+    src = img.copy().convert("RGBA")
+    w, h = src.size
+    if w <= 0 or h <= 0 or (h / w) < 1.55:
+        return src
+    crop_h = min(h, max(int(w / max(0.45, target_ratio)), int(h * 0.30)))
+    crop_h = min(crop_h, int(h * 0.58))
+    if position == "top":
+        y0 = max(0, int(h * 0.03))
+    elif position == "bottom":
+        y0 = max(0, h - crop_h - int(h * 0.04))
+    else:
+        y0 = max(0, (h - crop_h) // 2)
+    y0 = min(y0, max(0, h - crop_h))
+    return src.crop((0, y0, w, y0 + crop_h))
 
 
 def _gradient() -> Image.Image:
@@ -129,9 +147,9 @@ def _frame_hook(asset: Image.Image, logo: Image.Image, headline: str) -> Image.I
     base = _gradient()
     _frame_logo(base, logo)
     draw = ImageDraw.Draw(base)
-    _draw_multiline_centered(draw, headline, 235, 62, max_width=940, bold=True)
-    card = _rounded_card(asset, 930, 930)
-    _paste_center(base, card, 700)
+    _draw_multiline_centered(draw, headline, 210, 60, max_width=940, bold=True)
+    card = _rounded_card(asset, 1000, 1080)
+    _paste_center(base, card, 610)
     return base
 
 
@@ -139,26 +157,26 @@ def _frame_asset(asset: Image.Image, logo: Image.Image, title: str, note: str = 
     base = _gradient()
     _frame_logo(base, logo)
     draw = ImageDraw.Draw(base)
-    _draw_multiline_centered(draw, title, 225, 48, max_width=930, bold=True)
-    card = _rounded_card(asset, 980, 1040)
-    _paste_center(base, card, 520)
+    _draw_multiline_centered(draw, title, 205, 48, max_width=930, bold=True)
+    card = _rounded_card(asset, 1020, 1180)
+    _paste_center(base, card, 430)
     if note:
-        _draw_multiline_centered(draw, note, 1605, 31, max_width=890, fill=(220, 235, 255, 255))
+        _draw_multiline_centered(draw, note, 1660, 30, max_width=900, fill=(220, 235, 255, 255))
     return base
 
 
-def _frame_offer(asset1: Image.Image, asset2: Image.Image, logo: Image.Image, offer: str) -> Image.Image:
+def _frame_offer(asset1: Image.Image, asset2: Image.Image, logo: Image.Image, title: str, offer: str) -> Image.Image:
     base = _gradient()
     _frame_logo(base, logo)
     draw = ImageDraw.Draw(base)
-    _draw_centered(draw, "Semplice. Online. ECCOMI.", 220, 48, True)
-    a = _rounded_card(asset1, 760, 650)
-    b = _rounded_card(asset2, 600, 820)
-    base.alpha_composite(a, (35, 540))
-    base.alpha_composite(b, (OUT_W - b.width - 28, 830))
+    _draw_multiline_centered(draw, title or "Completa tutto online.", 205, 46, max_width=930, bold=True)
+    a = _rounded_card(asset1, 650, 780)
+    b = _rounded_card(asset2, 650, 780)
+    base.alpha_composite(a, (20, 525))
+    base.alpha_composite(b, (OUT_W - b.width - 20, 760))
     if offer:
-        draw.rounded_rectangle((145, 1565, 935, 1740), radius=82, fill=(255, 255, 255, 255))
-        _draw_centered(draw, offer, 1612, 48, True, fill=(5, 39, 120, 255), max_width=720)
+        draw.rounded_rectangle((145, 1570, 935, 1742), radius=82, fill=(255, 255, 255, 255))
+        _draw_centered(draw, offer, 1617, 47, True, fill=(5, 39, 120, 255), max_width=720)
     return base
 
 
@@ -166,9 +184,9 @@ def _frame_final(asset: Image.Image, logo: Image.Image, title: str, offer: str, 
     base = _gradient()
     _frame_logo(base, logo)
     draw = ImageDraw.Draw(base)
-    _draw_multiline_centered(draw, title, 225, 54, max_width=940, bold=True)
-    card = _rounded_card(asset, 760, 780)
-    _paste_center(base, card, 585)
+    _draw_multiline_centered(draw, title, 205, 54, max_width=940, bold=True)
+    card = _rounded_card(asset, 900, 900)
+    _paste_center(base, card, 500)
     if offer:
         _draw_centered(draw, offer, 1435, 42, True, fill=(220, 235, 255, 255))
     draw.rounded_rectangle((105, 1605, 975, 1782), radius=88, fill=(255, 255, 255, 255))
@@ -176,11 +194,13 @@ def _frame_final(asset: Image.Image, logo: Image.Image, title: str, offer: str, 
     return base
 
 
-def _motion_segment(ffmpeg: str, image_path: Path, duration: float, output: Path, zoom_in: bool = True) -> None:
+def _motion_segment(ffmpeg: str, image_path: Path, duration: float, output: Path, zoom_in: bool = True, stronger: bool = False) -> None:
+    step = 0.00115 if stronger else 0.0007
+    max_zoom = 1.085 if stronger else 1.055
     if zoom_in:
-        zoom = "min(zoom+0.0007,1.055)"
+        zoom = f"min(zoom+{step:.5f},{max_zoom:.3f})"
     else:
-        zoom = "if(eq(on,1),1.055,max(1.0,zoom-0.0007))"
+        zoom = f"if(eq(on,1),{max_zoom:.3f},max(1.0,zoom-{step:.5f}))"
     vf = (
         f"zoompan=z='{zoom}':"
         "x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':"
@@ -226,7 +246,7 @@ def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
             "Authorization": f"Bearer {anon_key}",
             "apikey": anon_key,
             "Content-Type": "application/json",
-            "User-Agent": "EVS-CPU-Commercial/1.0",
+            "User-Agent": "EVS-CPU-Commercial/2.0",
         },
         timeout=45,
     )
@@ -253,6 +273,9 @@ def register_commercial(app) -> None:
         target_duration = max(8.0, min(30.0, float(payload.get("target_duration_seconds") or 15.0)))
         voice_volume = max(0.1, min(2.0, float(payload.get("voice_volume") or 1.05)))
         music_volume = max(0.0, min(1.0, float(payload.get("music_volume") or 0.20)))
+        correction_mode = bool(payload.get("correction_mode"))
+        correction_note = str(payload.get("correction_note") or "").strip()
+        issues = [str(x).upper() for x in payload.get("issues", [])] if isinstance(payload.get("issues"), list) else []
 
         required = {
             "evs_code": evs_code,
@@ -275,6 +298,7 @@ def register_commercial(app) -> None:
         headline = str(payload.get("headline") or "Scoprilo con ECCOMI.").strip()
         scene2 = str(payload.get("scene_2_text") or "Tutto online, in pochi passaggi.").strip()
         scene3 = str(payload.get("scene_3_text") or "Completa la richiesta comodamente online.").strip()
+        scene4 = str(payload.get("scene_4_text") or "Completa tutto online.").strip()
         final_title = str(payload.get("final_title") or "ECCOMI ONLINE").strip()
         offer = str(payload.get("offer_text") or "").strip()
         cta = str(payload.get("cta_text") or "Scoprilo su Eccomi Online").strip()
@@ -292,12 +316,19 @@ def register_commercial(app) -> None:
             asset2 = Image.open(a2p).convert("RGBA")
             logo = Image.open(lp).convert("RGBA")
 
+            # V2: long web screenshots are shown as readable details instead of tiny full-page strips.
+            a1_top = _focus_crop(asset1, "top")
+            a1_mid = _focus_crop(asset1, "middle")
+            a2_mid = _focus_crop(asset2, "middle")
+            a2_bottom = _focus_crop(asset2, "bottom")
+            focus_enabled = (asset1.height / max(1, asset1.width) >= 1.55) or (asset2.height / max(1, asset2.width) >= 1.55)
+
             frames = [
-                _frame_hook(asset1, logo, headline),
-                _frame_asset(asset1, logo, scene2),
-                _frame_asset(asset2, logo, scene3),
-                _frame_offer(asset1, asset2, logo, offer),
-                _frame_final(asset2, logo, final_title, offer, cta),
+                _frame_hook(a1_top if focus_enabled else asset1, logo, headline),
+                _frame_asset(a1_mid if focus_enabled else asset1, logo, scene2),
+                _frame_asset(a2_mid if focus_enabled else asset2, logo, scene3),
+                _frame_offer(a1_mid if focus_enabled else asset1, a2_bottom if focus_enabled else asset2, logo, scene4, offer),
+                _frame_final(a2_bottom if focus_enabled else asset2, logo, final_title, offer, cta),
             ]
             frame_paths: list[Path] = []
             for idx, frame in enumerate(frames):
@@ -305,7 +336,7 @@ def register_commercial(app) -> None:
                 frame.save(p)
                 frame_paths.append(p)
 
-            durations = [2.5, 3.0, 3.0, 3.0, 3.5]
+            durations = [2.35, 2.65, 2.65, 2.85, 4.50] if correction_mode else [2.5, 3.0, 3.0, 3.0, 3.5]
             factor = target_duration / sum(durations)
             durations = [round(x * factor, 3) for x in durations]
             durations[-1] += target_duration - sum(durations)
@@ -314,7 +345,7 @@ def register_commercial(app) -> None:
             segments: list[Path] = []
             for idx, (frame_path, duration) in enumerate(zip(frame_paths, durations)):
                 seg = root / f"seg_{idx}.mp4"
-                _motion_segment(ffmpeg, frame_path, duration, seg, zoom_in=(idx % 2 == 0))
+                _motion_segment(ffmpeg, frame_path, duration, seg, zoom_in=(idx % 2 == 0), stronger=correction_mode or focus_enabled)
                 segments.append(seg)
 
             visual = root / "visual.mp4"
@@ -334,6 +365,11 @@ def register_commercial(app) -> None:
             "timeline_seconds": durations,
             "scene_count": 5,
             "commercial_product_service": True,
+            "commercial_engine_version": 2,
+            "correction_mode": correction_mode,
+            "correction_note": correction_note,
+            "issues": issues,
+            "focused_asset_crops": focus_enabled,
             "mascot_used": False,
             "primary_asset_url": asset1_url,
             "secondary_asset_url": asset2_url,
@@ -357,6 +393,8 @@ def register_commercial(app) -> None:
             "release_gate_required": True,
             "cpu_route": True,
             "commercial_product_service": True,
+            "commercial_engine_version": 2,
+            "focused_asset_crops": focus_enabled,
             "mascot_used": False,
         }
         _callback(payload, {
@@ -377,4 +415,5 @@ def register_commercial(app) -> None:
             "gpu_started": False,
             "route": "PRODUCT_SERVICE_CPU",
             "correction_protocol": COMMERCIAL_PROTOCOL,
+            "commercial_engine_version": 2,
         }
