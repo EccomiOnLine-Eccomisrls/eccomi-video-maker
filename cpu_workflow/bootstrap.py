@@ -1,5 +1,5 @@
 import main
-from commercial_task import register_commercial
+from commercial_task_v3 import register_commercial
 
 register_commercial(main.app)
 
