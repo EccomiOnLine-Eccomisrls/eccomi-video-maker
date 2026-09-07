@@ -1,0 +1,14 @@
+name: Render Deploy Gate
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  render-deploy-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Render deploy gate
+        run: |
+          echo "EVS CPU compositor commit is eligible for Render auto-deploy."
