@@ -194,15 +194,18 @@ def register_mascot(app) -> None:
                 supabase.storage.from_("videos").upload_to_signed_url(path=output_path, token=upload_token, file=fh)
 
         elapsed = round(time.perf_counter() - started, 3)
+        scene_count = 5
         generation = {
             "mode": "cpu_mascot_final_v1",
             "engine": "render_workflows_flex",
             "correction_protocol": MASCOT_PROTOCOL,
             "width": OUT_W,
             "height": OUT_H,
+            "fps": FPS,
+            "frames": int(round((target * FPS) / scene_count)),
             "output_duration_seconds": target,
             "timeline_seconds": durations,
-            "scene_count": 5,
+            "scene_count": scene_count,
             "raw_gpu_video_url": raw_video_url,
             "mascot_image_url": mascot_url,
             "voice_volume": voice_volume,
