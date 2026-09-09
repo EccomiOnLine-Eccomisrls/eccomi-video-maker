@@ -11,7 +11,7 @@ from supabase import create_client
 
 import commercial_task as base
 
-MASCOT_PROTOCOL = "EVS_MASCOT_FINAL_V1"
+MASCOT_PROTOCOL = "EVS_MASCOT_FINAL_V2"
 OUT_W, OUT_H, FPS = base.OUT_W, base.OUT_H, base.FPS
 
 
@@ -27,7 +27,7 @@ def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
             "Authorization": f"Bearer {anon_key}",
             "apikey": anon_key,
             "Content-Type": "application/json",
-            "User-Agent": "EVS-CPU-Mascot/1.0",
+            "User-Agent": "EVS-CPU-Mascot/2.0",
         },
         timeout=45,
     )
@@ -52,16 +52,22 @@ def _frame(mascot: Image.Image, logo: Image.Image | None, title: str, subtitle: 
     return canvas
 
 
-def _animated_segment(ffmpeg: str, raw_video: Path, bg: Path, duration: float, output: Path, y: int = 565) -> None:
-    # The GPU clip is deliberately contained, never stretched: identity geometry is preserved.
+def _immersive_animated_segment(ffmpeg: str, raw_video: Path, duration: float, output: Path) -> None:
+    """Integrate an APPROVED landscape GPU clip into the 9:16 canvas without a box over the official mascot.
+
+    The same raw clip is used as a softly blurred full-height background and as the sharp centered foreground.
+    This avoids the old solid rectangle + duplicated static mascot composition.
+    """
     filt = (
-        f"[0:v]scale=960:-2:force_original_aspect_ratio=decrease,"
-        f"pad=960:620:(ow-iw)/2:(oh-ih)/2:color=0x061944,format=yuv420p[anim];"
-        f"[1:v][anim]overlay=(W-w)/2:{y}:shortest=0,format=yuv420p[v]"
+        f"[0:v]split=2[bg][fg];"
+        f"[bg]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
+        f"crop={OUT_W}:{OUT_H},gblur=sigma=28:steps=2,"
+        f"eq=brightness=-0.12:saturation=0.82,format=yuv420p[bg2];"
+        f"[fg]scale={OUT_W}:-2:force_original_aspect_ratio=decrease,format=yuv420p[fg2];"
+        f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2:shortest=0,format=yuv420p[v]"
     )
     base._run([
         ffmpeg, "-y", "-stream_loop", "-1", "-i", str(raw_video),
-        "-loop", "1", "-i", str(bg),
         "-filter_complex", filt, "-map", "[v]", "-t", f"{duration:.3f}",
         "-r", str(FPS), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-movflags", "+faststart", str(output),
@@ -75,7 +81,7 @@ def _mix_optional_audio(ffmpeg: str, visual: Path, voice: Path | None, music: Pa
     if voice is not None:
         base._run([
             ffmpeg, "-y", "-i", str(visual), "-i", str(voice),
-            "-filter_complex", f"[1:a]volume={voice_volume:.3f},apad,alimiter=limit=0.95[a]",
+            "-filter_complex", f"[1:a]volume={voice_volume:.3f},apad,alimiter=limit=0.92[a]",
             "-map", "0:v:0", "-map", "[a]", "-t", f"{target:.3f}",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
         ])
@@ -83,7 +89,7 @@ def _mix_optional_audio(ffmpeg: str, visual: Path, voice: Path | None, music: Pa
     if music is not None:
         base._run([
             ffmpeg, "-y", "-i", str(visual), "-stream_loop", "-1", "-i", str(music),
-            "-filter_complex", f"[1:a]volume={music_volume:.3f},apad[a]",
+            "-filter_complex", f"[1:a]volume={music_volume:.3f},apad,alimiter=limit=0.92[a]",
             "-map", "0:v:0", "-map", "[a]", "-t", f"{target:.3f}",
             "-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", str(output),
         ])
@@ -110,6 +116,8 @@ def register_mascot(app) -> None:
         target = max(8.0, min(30.0, float(payload.get("target_duration_seconds") or 15.0)))
         voice_volume = max(0.1, min(2.0, float(payload.get("voice_volume") or 1.0)))
         music_volume = max(0.0, min(1.0, float(payload.get("music_volume") or 0.20)))
+        gpu_identity_approved = payload.get("gpu_identity_approved") is True
+        identity_gate_status = str(payload.get("identity_gate_status") or ("PASS" if gpu_identity_approved else "PENDING")).strip().upper()
 
         required = {
             "evs_code": evs_code,
@@ -169,10 +177,12 @@ def register_mascot(app) -> None:
             segments: list[Path] = []
             for idx, (frame_path, duration) in enumerate(zip(frame_paths, durations)):
                 seg = root / f"seg_{idx}.mp4"
-                if idx in {0, 2, 4}:
-                    _animated_segment(ffmpeg, rawp, frame_path, duration, seg, y=600 if idx != 4 else 520)
+                if gpu_identity_approved and idx in {0, 2, 4}:
+                    _immersive_animated_segment(ffmpeg, rawp, duration, seg)
                 else:
-                    base._motion_segment(ffmpeg, frame_path, duration, seg, zoom_in=(idx % 2 == 0), stronger=True)
+                    # Identity-safe fallback: use only the APPROVED official mascot asset.
+                    # The unapproved GPU clip is never composited into the customer master.
+                    base._motion_segment(ffmpeg, frame_path, duration, seg, zoom_in=(idx % 2 == 0), stronger=False)
                 segments.append(seg)
 
             visual = root / "visual.mp4"
@@ -196,7 +206,7 @@ def register_mascot(app) -> None:
         elapsed = round(time.perf_counter() - started, 3)
         scene_count = 5
         generation = {
-            "mode": "cpu_mascot_final_v1",
+            "mode": "cpu_mascot_final_v2",
             "engine": "render_workflows_flex",
             "correction_protocol": MASCOT_PROTOCOL,
             "width": OUT_W,
@@ -210,6 +220,9 @@ def register_mascot(app) -> None:
             "mascot_image_url": mascot_url,
             "voice_volume": voice_volume,
             "music_volume": music_volume,
+            "identity_gate_status": identity_gate_status,
+            "gpu_identity_approved": gpu_identity_approved,
+            "layout_mode": "IMMERSIVE_RAW_WITH_BLURRED_CANVAS" if gpu_identity_approved else "OFFICIAL_ASSET_SAFE_STATIC",
             "total_seconds": elapsed,
         }
         qa = {
@@ -218,7 +231,10 @@ def register_mascot(app) -> None:
             "output_height": OUT_H,
             "target_duration_seconds": target,
             "mascot_asset_composited": True,
-            "gpu_animation_composited": True,
+            "gpu_animation_composited": gpu_identity_approved,
+            "identity_gate_required": True,
+            "identity_gate_passed": gpu_identity_approved,
+            "identity_gate_status": identity_gate_status,
             "voice_present": bool(voice_url),
             "music_present": bool(music_url),
             "release_gate_required": True,
@@ -241,6 +257,8 @@ def register_mascot(app) -> None:
             "video_url": output_public_url,
             "processing_seconds": elapsed,
             "gpu_started": False,
-            "route": "MASCOT_GPU_PLUS_CPU_FINAL_V1",
+            "route": "MASCOT_GPU_PLUS_CPU_FINAL_V2",
+            "identity_gate_status": identity_gate_status,
+            "gpu_identity_approved": gpu_identity_approved,
             "correction_protocol": MASCOT_PROTOCOL,
         }
