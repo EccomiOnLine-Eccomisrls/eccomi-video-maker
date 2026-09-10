@@ -126,8 +126,6 @@ def register_surgical(app) -> None:
         if not keep:
             raise ValueError("NO_CLEAN_SEGMENTS_AVAILABLE")
 
-        # Build a complete, non-overlapping timeline. Original clean intervals stay in place;
-        # rejected intervals are filled only with already-approved clean motion from this master.
         timeline: list[dict[str, Any]] = []
         cursor = 0.0
         for bad in replace:
@@ -174,6 +172,11 @@ def register_surgical(app) -> None:
             "replace_segments": replace,
             "keep_segments": keep,
             "timeline": timeline,
+            "width": OUT_W,
+            "height": OUT_H,
+            "fps": FPS,
+            "frames": int(round(target * FPS)),
+            "scene_count": 1,
             "target_duration_seconds": target,
             "audio_preserved_from_source": True,
             "gpu_started": False,
