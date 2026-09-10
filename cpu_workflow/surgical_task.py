@@ -10,7 +10,8 @@ from supabase import create_client
 
 import main as base
 
-SURGICAL_PROTOCOL = "EVS_SURGICAL_REPAIR_V1"
+SURGICAL_PROTOCOL = "EVS_SURGICAL_REPAIR_V2"
+MOTION_PROFILE = "SMART_MOTION_V2"
 OUT_W, OUT_H, FPS = base.OUT_W, base.OUT_H, base.FPS
 
 
@@ -26,7 +27,7 @@ def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
             "Authorization": f"Bearer {anon_key}",
             "apikey": anon_key,
             "Content-Type": "application/json",
-            "User-Agent": "EVS-Surgical-Repair/1.0",
+            "User-Agent": "EVS-Surgical-Repair/2.0",
         },
         timeout=45,
     )
@@ -64,21 +65,56 @@ def _complement(replace: list[dict[str, float]], target: float) -> list[dict[str
     return [x for x in out if x["end"] - x["start"] >= 0.20]
 
 
-def _extract(ffmpeg: str, source: Path, start: float, duration: float, output: Path) -> None:
+def _motion_filter(variant: int, strength: float = 1.0) -> str:
+    # Safe Ken-Burns motion on the full approved frame. Maximum zoom stays around 2.5–3.5%
+    # so text/layout remain readable while the shot no longer feels like a frozen poster.
+    step = 0.00022 * max(0.5, min(1.4, strength))
+    max_zoom = 1.028 + 0.004 * (variant % 3)
+    if variant % 4 == 0:
+        z = f"min(zoom+{step:.6f},{max_zoom:.4f})"
+        x = "iw/2-(iw/zoom/2)+sin(on/22)*4"
+        y = "ih/2-(ih/zoom/2)+cos(on/29)*6"
+    elif variant % 4 == 1:
+        z = f"min(zoom+{step * 0.85:.6f},{max_zoom:.4f})"
+        x = "iw/2-(iw/zoom/2)+sin(on/28)*7"
+        y = "ih/2-(ih/zoom/2)"
+    elif variant % 4 == 2:
+        z = f"min(zoom+{step * 0.70:.6f},{max_zoom:.4f})"
+        x = "iw/2-(iw/zoom/2)"
+        y = "ih/2-(ih/zoom/2)+sin(on/31)*8"
+    else:
+        z = f"min(zoom+{step * 0.95:.6f},{max_zoom:.4f})"
+        x = "iw/2-(iw/zoom/2)-sin(on/26)*6"
+        y = "ih/2-(ih/zoom/2)-cos(on/33)*5"
+    return (
+        f"scale={OUT_W}:{OUT_H},"
+        f"zoompan=z='{z}':x='{x}':y='{y}':d=1:s={OUT_W}x{OUT_H}:fps={FPS},"
+        "format=yuv420p"
+    )
+
+
+def _extract(ffmpeg: str, source: Path, start: float, duration: float, output: Path,
+             motion_variant: int | None = None, motion_strength: float = 1.0) -> None:
+    vf = (
+        _motion_filter(motion_variant, motion_strength)
+        if motion_variant is not None
+        else f"scale={OUT_W}:{OUT_H},fps={FPS},format=yuv420p"
+    )
     base._run([
         ffmpeg, "-y", "-ss", f"{start:.3f}", "-i", str(source), "-t", f"{duration:.3f}",
-        "-vf", f"scale={OUT_W}:{OUT_H},fps={FPS},format=yuv420p", "-an",
+        "-vf", vf, "-an",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-movflags", "+faststart", str(output),
     ])
 
 
-def _loop_clean(ffmpeg: str, source: Path, clean: dict[str, float], duration: float, output: Path) -> None:
+def _loop_clean_motion(ffmpeg: str, source: Path, clean: dict[str, float], duration: float,
+                       output: Path, variant: int) -> None:
     seed = output.with_name(output.stem + "_seed.mp4")
-    seed_dur = max(0.2, clean["end"] - clean["start"])
+    seed_dur = max(0.35, clean["end"] - clean["start"])
     _extract(ffmpeg, source, clean["start"], seed_dur, seed)
     base._run([
         ffmpeg, "-y", "-stream_loop", "-1", "-i", str(seed), "-t", f"{duration:.3f}",
-        "-vf", f"scale={OUT_W}:{OUT_H},fps={FPS},format=yuv420p", "-an",
+        "-vf", _motion_filter(variant, 1.12), "-an",
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-movflags", "+faststart", str(output),
     ])
 
@@ -107,6 +143,8 @@ def register_surgical(app) -> None:
         source_version = int(payload.get("source_version") or 0)
         replace = _norm_segments(payload.get("replace_segments"), target)
         keep = _norm_segments(payload.get("keep_segments"), target) or _complement(replace, target)
+        motion_profile = str(payload.get("motion_profile") or MOTION_PROFILE).strip().upper()
+        animate_kept = payload.get("animate_kept_segments") is not False
 
         required = {
             "evs_code": evs_code,
@@ -136,11 +174,12 @@ def register_surgical(app) -> None:
         if cursor < target - 0.01:
             timeline.append({"kind": "KEEP", "start": cursor, "end": target})
 
-        with tempfile.TemporaryDirectory(prefix="evs_surgical_") as tmpdir:
+        motion_plan: list[dict[str, Any]] = []
+        with tempfile.TemporaryDirectory(prefix="evs_surgical_v2_") as tmpdir:
             root = Path(tmpdir)
             source = root / "source.mp4"
             visual = root / "visual.mp4"
-            output = root / "surgical_final.mp4"
+            output = root / "surgical_v2_final.mp4"
             base._download(source_url, source)
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             parts: list[Path] = []
@@ -148,12 +187,26 @@ def register_surgical(app) -> None:
             for idx, item in enumerate(timeline):
                 dur = max(0.05, float(item["end"]) - float(item["start"]))
                 out = root / f"part_{idx:02d}.mp4"
+                variant = idx % 4
                 if item["kind"] == "KEEP":
-                    _extract(ffmpeg, source, float(item["start"]), dur, out)
+                    _extract(
+                        ffmpeg, source, float(item["start"]), dur, out,
+                        motion_variant=variant if animate_kept else None,
+                        motion_strength=0.72,
+                    )
+                    motion_plan.append({"timeline_index": idx, "kind": "KEEP", "variant": variant, "animated": animate_kept})
                 else:
+                    # Rotate through clean shots so separate repaired areas do not reuse exactly the same source.
                     clean = keep[clean_idx % len(keep)]
                     clean_idx += 1
-                    _loop_clean(ffmpeg, source, clean, dur, out)
+                    _loop_clean_motion(ffmpeg, source, clean, dur, out, variant)
+                    motion_plan.append({
+                        "timeline_index": idx,
+                        "kind": "REPLACE",
+                        "variant": variant,
+                        "animated": True,
+                        "clean_source": clean,
+                    })
                 parts.append(out)
             base._concat_video(ffmpeg, parts, visual)
             _attach_original_audio(ffmpeg, visual, source, target, output)
@@ -164,14 +217,17 @@ def register_surgical(app) -> None:
 
         elapsed = round(time.perf_counter() - started, 3)
         generation = {
-            "mode": "cpu_surgical_repair_non_gpu",
+            "mode": "cpu_surgical_repair_smart_motion_v2",
             "engine": "render_workflows_flex",
             "correction_protocol": SURGICAL_PROTOCOL,
+            "motion_profile": motion_profile,
             "source_master_url": source_url,
             "source_version": source_version,
             "replace_segments": replace,
             "keep_segments": keep,
             "timeline": timeline,
+            "motion_plan": motion_plan,
+            "animate_kept_segments": animate_kept,
             "width": OUT_W,
             "height": OUT_H,
             "fps": FPS,
@@ -185,6 +241,8 @@ def register_surgical(app) -> None:
         qa = {
             "technical_pass": True,
             "surgical_repair_applied": True,
+            "smart_motion_applied": True,
+            "motion_profile": motion_profile,
             "full_regenerate": False,
             "gpu_started": False,
             "audio_preserved": True,
@@ -216,7 +274,8 @@ def register_surgical(app) -> None:
             "video_url": output_public_url,
             "processing_seconds": elapsed,
             "gpu_started": False,
-            "route": "SURGICAL_REPAIR_CPU_ONLY",
+            "route": "SURGICAL_REPAIR_CPU_SMART_MOTION_V2",
             "correction_protocol": SURGICAL_PROTOCOL,
+            "motion_profile": motion_profile,
             "replaced_segment_count": len(replace),
         }
