@@ -337,7 +337,7 @@ torch.cuda.empty_cache()
 print(f"--> [MODEL] Caricato in {time.perf_counter()-model_started:.1f}s", flush=True)
 
 
-def generate_clip(init_image: Image.Image, prompt: str) -> str:
+def generate_clip(init_image: Image.Image, prompt: str, width=WAN_WIDTH, height=WAN_HEIGHT, frames=WAN_FRAMES, fps=FPS) -> str:
     gc.collect()
     torch.cuda.empty_cache()
     try:
@@ -350,15 +350,15 @@ def generate_clip(init_image: Image.Image, prompt: str) -> str:
         result = pipe(
             image=init_image.convert("RGB"),
             prompt=enhance_prompt(prompt),
-            height=WAN_HEIGHT,
-            width=WAN_WIDTH,
-            num_frames=WAN_FRAMES,
+            height=height,
+            width=width,
+            num_frames=frames,
             num_inference_steps=WAN_STEPS,
             guidance_scale=WAN_GUIDANCE,
         )
     frames = result.frames[0]
     path = tmp(".mp4")
-    export_to_video(frames, path, fps=FPS)
+    export_to_video(frames, path, fps=fps)
     del frames, result
     gc.collect()
     torch.cuda.empty_cache()
@@ -420,7 +420,21 @@ def handler(event):
     prompts = inp.get("scenes_prompts") or DEFAULT_SCENES
     commercial_mode = bool(inp.get("commercial_mode", True))
     target_duration = float(inp.get("target_duration_seconds") or 15.0)
-    target_duration = max(8.0, min(target_duration, 30.0))
+    clip_first = bool(inp.get("clip_first", False))
+
+    if clip_first:
+        # Wan 2.1 720P: vertical native canvas, standard 81-frame ~5s motion clip.
+        target_duration = max(4.5, min(target_duration, 5.0))
+        gen_width = 720
+        gen_height = 1280
+        gen_frames = 81
+        render_fps = 16
+    else:
+        target_duration = max(8.0, min(target_duration, 30.0))
+        gen_width = WAN_WIDTH
+        gen_height = WAN_HEIGHT
+        gen_frames = WAN_FRAMES
+        render_fps = FPS
 
     desktop_url = clean(inp.get("desktop_asset_url"))
     mobile_url = clean(inp.get("mobile_asset_url"))
@@ -450,6 +464,7 @@ def handler(event):
             "error": error,
             "details": details or None,
             "commercial_mode": commercial_mode,
+            "clip_first": clip_first,
         }
         payload["delivery"] = send_callback(callback_url, payload)
         return payload
@@ -478,8 +493,22 @@ def handler(event):
             validate_image(logo, "LOGO")
             print(f"--> [PREFLIGHT] desktop={desktop.size} mobile={mobile.size} logo={logo.size} CTA=OK", flush=True)
 
-        init_image = fetch_image(mascot_url, rgba=False)
+        init_image = fetch_image(mascot_url, rgba=clip_first)
         validate_image(init_image, "MASCOT")
+
+        if clip_first:
+            # Preserve PNG transparency and establish the requested ECCOMI-blue scene
+            # before I2V inference. This prevents transparent pixels becoming black.
+            src = init_image.convert("RGBA")
+            canvas = Image.new("RGBA", (gen_width, gen_height), (7, 66, 180, 255))
+            src.thumbnail((int(gen_width * 0.86), int(gen_height * 0.90)), Image.Resampling.LANCZOS)
+            x = (gen_width - src.width) // 2
+            y = (gen_height - src.height) // 2
+            canvas.alpha_composite(src, (x, y))
+            init_image = canvas.convert("RGB")
+            print(f"--> [CLIP FIRST] reference={gen_width}x{gen_height} blue canvas | frames={gen_frames} | fps={render_fps}", flush=True)
+        else:
+            init_image = init_image.convert("RGB")
 
         if not isinstance(prompts, list) or not prompts:
             prompts = DEFAULT_SCENES
@@ -487,7 +516,7 @@ def handler(event):
 
         for i, prompt in enumerate(prompts):
             print(f"--> [SCENA] {i+1}/{len(prompts)}", flush=True)
-            generated.append(generate_clip(init_image, prompt))
+            generated.append(generate_clip(init_image, prompt, width=gen_width, height=gen_height, frames=gen_frames, fps=render_fps))
 
         if commercial_mode:
             final_base, extra_segments, extra_clips, timeline_durations = commercial_timeline(
@@ -495,6 +524,13 @@ def handler(event):
             )
         else:
             final_base, opened_video = legacy_timeline(generated)
+            if clip_first:
+                # No looping/filler: the GPU itself must provide the requested motion span.
+                if final_base.duration < target_duration - 0.15:
+                    raise RuntimeError(
+                        f"CLIP_FIRST_DURATION_TOO_SHORT:{final_base.duration:.3f}s<{target_duration:.3f}s"
+                    )
+                final_base = final_base.subclip(0, target_duration)
             timeline_durations = [round(final_base.duration, 3)]
 
         audio_layers = []
@@ -526,7 +562,7 @@ def handler(event):
         print("--> [RENDER] Master commerciale...", flush=True)
         final.write_videofile(
             output,
-            fps=FPS,
+            fps=render_fps,
             codec="libx264",
             audio_codec="aac",
             preset="medium",
@@ -548,8 +584,10 @@ def handler(event):
         technical_qa = {
             "technical_pass": True,
             "commercial_mode": commercial_mode,
-            "output_width": OUT_W if commercial_mode else WAN_WIDTH,
-            "output_height": OUT_H if commercial_mode else WAN_HEIGHT,
+            "output_width": OUT_W if commercial_mode else gen_width,
+            "output_height": OUT_H if commercial_mode else gen_height,
+            "clip_first": clip_first,
+            "clip_first_spec_pass": (not clip_first) or (gen_width == 720 and gen_height == 1280 and abs(final.duration - target_duration) <= 0.20),
             "target_duration_seconds": round(target_duration, 2),
             "desktop_asset_composited": bool(commercial_mode and desktop_url),
             "mobile_asset_composited": bool(commercial_mode and mobile_url),
@@ -564,12 +602,14 @@ def handler(event):
         generation = {
             "model": MODEL_ID,
             "mode": "full_gpu_80gb_commercial" if commercial_mode else "full_gpu_80gb",
-            "wan_width": WAN_WIDTH,
-            "wan_height": WAN_HEIGHT,
-            "frames": WAN_FRAMES,
+            "wan_width": gen_width,
+            "wan_height": gen_height,
+            "frames": gen_frames,
             "steps": WAN_STEPS,
             "guidance_scale": WAN_GUIDANCE,
-            "fps": FPS,
+            "fps": render_fps,
+            "clip_first": clip_first,
+            "worker_version": "CLIP_FIRST_V2_VERTICAL_5S",
             "scene_count": len(generated),
             "timeline_seconds": timeline_durations,
             "total_seconds": round(elapsed, 2),
