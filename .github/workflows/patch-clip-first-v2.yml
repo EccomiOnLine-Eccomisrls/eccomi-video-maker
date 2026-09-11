@@ -1,0 +1,103 @@
+name: Patch clip-first worker v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/patch-clip-first-v2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch handler_commercial.py
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('handler_commercial.py')
+          s = path.read_text()
+
+          def rep(old, new, label):
+              global s
+              if old not in s:
+                  raise SystemExit(f'PATCH_MISSING:{label}')
+              s = s.replace(old, new, 1)
+
+          rep(
+              'def generate_clip(init_image: Image.Image, prompt: str) -> str:',
+              'def generate_clip(init_image: Image.Image, prompt: str, width=WAN_WIDTH, height=WAN_HEIGHT, frames=WAN_FRAMES, fps=FPS) -> str:',
+              'generate_signature',
+          )
+          rep(
+              '            height=WAN_HEIGHT,\n            width=WAN_WIDTH,\n            num_frames=WAN_FRAMES,',
+              '            height=height,\n            width=width,\n            num_frames=frames,',
+              'wan_dynamic_geometry',
+          )
+          rep(
+              '    export_to_video(frames, path, fps=FPS)',
+              '    export_to_video(frames, path, fps=fps)',
+              'wan_dynamic_fps',
+          )
+          rep(
+              '    target_duration = float(inp.get("target_duration_seconds") or 15.0)\n    target_duration = max(8.0, min(target_duration, 30.0))',
+              '''    target_duration = float(inp.get("target_duration_seconds") or 15.0)\n    clip_first = bool(inp.get("clip_first", False))\n\n    if clip_first:\n        # Wan 2.1 720P: vertical native canvas, standard 81-frame ~5s motion clip.\n        target_duration = max(4.5, min(target_duration, 5.0))\n        gen_width = 720\n        gen_height = 1280\n        gen_frames = 81\n        render_fps = 16\n    else:\n        target_duration = max(8.0, min(target_duration, 30.0))\n        gen_width = WAN_WIDTH\n        gen_height = WAN_HEIGHT\n        gen_frames = WAN_FRAMES\n        render_fps = FPS''',
+              'clip_first_config',
+          )
+          rep(
+              '        init_image = fetch_image(mascot_url, rgba=False)\n        validate_image(init_image, "MASCOT")',
+              '''        init_image = fetch_image(mascot_url, rgba=clip_first)\n        validate_image(init_image, "MASCOT")\n\n        if clip_first:\n            # Preserve PNG transparency and establish the requested ECCOMI-blue scene\n            # before I2V inference. This prevents transparent pixels becoming black.\n            src = init_image.convert("RGBA")\n            canvas = Image.new("RGBA", (gen_width, gen_height), (7, 66, 180, 255))\n            src.thumbnail((int(gen_width * 0.86), int(gen_height * 0.90)), Image.Resampling.LANCZOS)\n            x = (gen_width - src.width) // 2\n            y = (gen_height - src.height) // 2\n            canvas.alpha_composite(src, (x, y))\n            init_image = canvas.convert("RGB")\n            print(f"--> [CLIP FIRST] reference={gen_width}x{gen_height} blue canvas | frames={gen_frames} | fps={render_fps}", flush=True)\n        else:\n            init_image = init_image.convert("RGB")''',
+              'clip_first_reference_canvas',
+          )
+          rep(
+              '            generated.append(generate_clip(init_image, prompt))',
+              '            generated.append(generate_clip(init_image, prompt, width=gen_width, height=gen_height, frames=gen_frames, fps=render_fps))',
+              'dynamic_generate_call',
+          )
+          rep(
+              '''        else:\n            final_base, opened_video = legacy_timeline(generated)\n            timeline_durations = [round(final_base.duration, 3)]''',
+              '''        else:\n            final_base, opened_video = legacy_timeline(generated)\n            if clip_first:\n                # No looping/filler: the GPU itself must provide the requested motion span.\n                if final_base.duration < target_duration - 0.15:\n                    raise RuntimeError(\n                        f"CLIP_FIRST_DURATION_TOO_SHORT:{final_base.duration:.3f}s<{target_duration:.3f}s"\n                    )\n                final_base = final_base.subclip(0, target_duration)\n            timeline_durations = [round(final_base.duration, 3)]''',
+              'clip_first_duration_gate',
+          )
+          rep(
+              '            fps=FPS,\n            codec="libx264",',
+              '            fps=render_fps,\n            codec="libx264",',
+              'dynamic_render_fps',
+          )
+          rep(
+              '''            "output_width": OUT_W if commercial_mode else WAN_WIDTH,\n            "output_height": OUT_H if commercial_mode else WAN_HEIGHT,''',
+              '''            "output_width": OUT_W if commercial_mode else gen_width,\n            "output_height": OUT_H if commercial_mode else gen_height,\n            "clip_first": clip_first,\n            "clip_first_spec_pass": (not clip_first) or (gen_width == 720 and gen_height == 1280 and abs(final.duration - target_duration) <= 0.20),''',
+              'qa_dynamic_geometry',
+          )
+          rep(
+              '''            "wan_width": WAN_WIDTH,\n            "wan_height": WAN_HEIGHT,\n            "frames": WAN_FRAMES,''',
+              '''            "wan_width": gen_width,\n            "wan_height": gen_height,\n            "frames": gen_frames,''',
+              'generation_dynamic_geometry',
+          )
+          rep(
+              '            "fps": FPS,\n            "scene_count": len(generated),',
+              '            "fps": render_fps,\n            "clip_first": clip_first,\n            "worker_version": "CLIP_FIRST_V2_VERTICAL_5S",\n            "scene_count": len(generated),',
+              'generation_worker_version',
+          )
+          rep(
+              '''            "commercial_mode": commercial_mode,\n        }''',
+              '''            "commercial_mode": commercial_mode,\n            "clip_first": clip_first,\n        }''',
+              'callback_clip_first',
+          )
+
+          path.write_text(s)
+          print('PATCH_OK')
+          PY
+
+      - name: Commit worker patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add handler_commercial.py
+          git commit -m 'fix: generate real 5s vertical mascot clip-first' || exit 0
+          git push
