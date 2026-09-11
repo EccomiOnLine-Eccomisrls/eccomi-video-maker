@@ -11,7 +11,7 @@ from supabase import create_client
 
 import commercial_task as base
 
-MASCOT_PROTOCOL = "EVS_MASCOT_FINAL_V2"
+MASCOT_PROTOCOL = "EVS_MASCOT_FINAL_V3_CONTINUOUS"
 OUT_W, OUT_H, FPS = base.OUT_W, base.OUT_H, base.FPS
 
 
@@ -27,7 +27,7 @@ def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
             "Authorization": f"Bearer {anon_key}",
             "apikey": anon_key,
             "Content-Type": "application/json",
-            "User-Agent": "EVS-CPU-Mascot/2.0",
+            "User-Agent": "EVS-CPU-Mascot/3.0",
         },
         timeout=45,
     )
@@ -52,24 +52,22 @@ def _frame(mascot: Image.Image, logo: Image.Image | None, title: str, subtitle: 
     return canvas
 
 
-def _immersive_animated_segment(ffmpeg: str, raw_video: Path, duration: float, output: Path) -> None:
-    """Integrate an APPROVED landscape GPU clip into the 9:16 canvas without a box over the official mascot.
+def _continuous_approved_video(ffmpeg: str, raw_video: Path, duration: float, output: Path) -> None:
+    """Use the approved generated video continuously for the full master.
 
-    The same raw clip is used as a softly blurred full-height background and as the sharp centered foreground.
-    This avoids the old solid rectangle + duplicated static mascot composition.
+    Grok already returns a portrait 9:16 asset. This stage may normalize it to
+    EVS output dimensions, but it must never alternate it with static mascot cards
+    or restart the source at every scene boundary.
     """
     filt = (
-        f"[0:v]split=2[bg][fg];"
-        f"[bg]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=increase,"
-        f"crop={OUT_W}:{OUT_H},gblur=sigma=28:steps=2,"
-        f"eq=brightness=-0.12:saturation=0.82,format=yuv420p[bg2];"
-        f"[fg]scale={OUT_W}:-2:force_original_aspect_ratio=decrease,format=yuv420p[fg2];"
-        f"[bg2][fg2]overlay=(W-w)/2:(H-h)/2:shortest=0,format=yuv420p[v]"
+        f"[0:v]scale={OUT_W}:{OUT_H}:force_original_aspect_ratio=decrease,"
+        f"pad={OUT_W}:{OUT_H}:(ow-iw)/2:(oh-ih)/2:color=0x061d55,"
+        f"fps={FPS},format=yuv420p[v]"
     )
     base._run([
         ffmpeg, "-y", "-stream_loop", "-1", "-i", str(raw_video),
         "-filter_complex", filt, "-map", "[v]", "-t", f"{duration:.3f}",
-        "-r", str(FPS), "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
         "-movflags", "+faststart", str(output),
     ])
 
@@ -142,7 +140,7 @@ def register_mascot(app) -> None:
 
         with tempfile.TemporaryDirectory(prefix="evs_mascot_final_") as tmpdir:
             root = Path(tmpdir)
-            rawp, mascp = root / "gpu.mp4", root / "mascot"
+            rawp, mascp = root / "provider.mp4", root / "mascot"
             voicep, musicp, logop = root / "voice.wav", root / "music.wav", root / "logo"
             base._download(raw_video_url, rawp)
             base._download(mascot_url, mascp)
@@ -153,41 +151,26 @@ def register_mascot(app) -> None:
             if logo_url:
                 base._download(logo_url, logop)
 
-            mascot = Image.open(mascp).convert("RGBA")
-            logo = Image.open(logop).convert("RGBA") if logo_url else None
-            frames = [
-                _frame(mascot, logo, headline, mascot_name),
-                _frame(mascot, logo, brand, message),
-                _frame(mascot, logo, mascot_name, "Identità · Voce · Continuità"),
-                _frame(mascot, logo, brand, message),
-                _frame(mascot, logo, mascot_name, "", cta),
-            ]
-            frame_paths: list[Path] = []
-            for idx, frame in enumerate(frames):
-                p = root / f"frame_{idx}.png"
-                frame.save(p)
-                frame_paths.append(p)
-
-            durations = [2.4, 2.8, 3.0, 2.8, 4.0]
-            factor = target / sum(durations)
-            durations = [round(x * factor, 3) for x in durations]
-            durations[-1] += target - sum(durations)
-
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-            segments: list[Path] = []
-            for idx, (frame_path, duration) in enumerate(zip(frame_paths, durations)):
-                seg = root / f"seg_{idx}.mp4"
-                if gpu_identity_approved and idx in {0, 2, 4}:
-                    _immersive_animated_segment(ffmpeg, rawp, duration, seg)
-                else:
-                    # Identity-safe fallback: use only the APPROVED official mascot asset.
-                    # The unapproved GPU clip is never composited into the customer master.
-                    base._motion_segment(ffmpeg, frame_path, duration, seg, zoom_in=(idx % 2 == 0), stronger=False)
-                segments.append(seg)
-
             visual = root / "visual.mp4"
             output = root / "mascot_final.mp4"
-            base._concat_video(ffmpeg, segments, visual)
+
+            if gpu_identity_approved:
+                _continuous_approved_video(ffmpeg, rawp, target, visual)
+                layout_mode = "CONTINUOUS_APPROVED_PROVIDER_VIDEO"
+                scene_count = 1
+                timeline = [target]
+            else:
+                mascot = Image.open(mascp).convert("RGBA")
+                logo = Image.open(logop).convert("RGBA") if logo_url else None
+                fallback = _frame(mascot, logo, headline or brand, mascot_name, cta)
+                frame_path = root / "fallback.png"
+                fallback.save(frame_path)
+                base._motion_segment(ffmpeg, frame_path, target, visual, zoom_in=True, stronger=False)
+                layout_mode = "OFFICIAL_ASSET_SAFE_STATIC"
+                scene_count = 1
+                timeline = [target]
+
             _mix_optional_audio(
                 ffmpeg,
                 visual,
@@ -204,17 +187,16 @@ def register_mascot(app) -> None:
                 supabase.storage.from_("videos").upload_to_signed_url(path=output_path, token=upload_token, file=fh)
 
         elapsed = round(time.perf_counter() - started, 3)
-        scene_count = 5
         generation = {
-            "mode": "cpu_mascot_final_v2",
+            "mode": "cpu_mascot_final_v3_continuous",
             "engine": "render_workflows_flex",
             "correction_protocol": MASCOT_PROTOCOL,
             "width": OUT_W,
             "height": OUT_H,
             "fps": FPS,
-            "frames": int(round((target * FPS) / scene_count)),
+            "frames": int(round(target * FPS)),
             "output_duration_seconds": target,
-            "timeline_seconds": durations,
+            "timeline_seconds": timeline,
             "scene_count": scene_count,
             "raw_gpu_video_url": raw_video_url,
             "mascot_image_url": mascot_url,
@@ -222,7 +204,10 @@ def register_mascot(app) -> None:
             "music_volume": music_volume,
             "identity_gate_status": identity_gate_status,
             "gpu_identity_approved": gpu_identity_approved,
-            "layout_mode": "IMMERSIVE_RAW_WITH_BLURRED_CANVAS" if gpu_identity_approved else "OFFICIAL_ASSET_SAFE_STATIC",
+            "layout_mode": layout_mode,
+            "text_overlay_deferred": True,
+            "message": message,
+            "cta_text": cta,
             "total_seconds": elapsed,
         }
         qa = {
@@ -230,7 +215,7 @@ def register_mascot(app) -> None:
             "output_width": OUT_W,
             "output_height": OUT_H,
             "target_duration_seconds": target,
-            "mascot_asset_composited": True,
+            "mascot_asset_composited": not gpu_identity_approved,
             "gpu_animation_composited": gpu_identity_approved,
             "identity_gate_required": True,
             "identity_gate_passed": gpu_identity_approved,
@@ -240,6 +225,7 @@ def register_mascot(app) -> None:
             "release_gate_required": True,
             "ai_brand_redraw": False,
             "cpu_mascot_final": True,
+            "continuous_source_preserved": gpu_identity_approved,
         }
         _callback(payload, {
             "event": "evs.video.completed",
@@ -257,7 +243,7 @@ def register_mascot(app) -> None:
             "video_url": output_public_url,
             "processing_seconds": elapsed,
             "gpu_started": False,
-            "route": "MASCOT_GPU_PLUS_CPU_FINAL_V2",
+            "route": "MASCOT_PROVIDER_PLUS_CPU_FINAL_V3_CONTINUOUS",
             "identity_gate_status": identity_gate_status,
             "gpu_identity_approved": gpu_identity_approved,
             "correction_protocol": MASCOT_PROTOCOL,
