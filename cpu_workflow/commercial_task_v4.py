@@ -5,13 +5,13 @@ from typing import Any
 
 import imageio_ffmpeg
 import requests
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageChops
 from render import Retry, TaskContext
 from supabase import create_client
 
 import commercial_task as v2
 
-COMMERCIAL_PROTOCOL = "EVS_COMMERCIAL_PRODUCT_SERVICE_V4_GUIDED_ASSET"
+COMMERCIAL_PROTOCOL = "EVS_COMMERCIAL_PRODUCT_SERVICE_V5_CORRECTION_CONTRACT"
 
 
 def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
@@ -32,6 +32,42 @@ def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
     )
     if not response.ok:
         raise RuntimeError(f"CALLBACK_FAILED HTTP {response.status_code}: {response.text[:1200]}")
+
+
+def _logo_overlay_contract(payload: dict[str, Any], note: str) -> dict[str, Any]:
+    raw = payload.get("logo_overlay")
+    if isinstance(raw, dict):
+        enabled = bool(raw.get("enabled"))
+        position = str(raw.get("position") or "top-left").strip().lower()
+        duration = str(raw.get("duration") or "full").strip().lower()
+        return {
+            "enabled": enabled,
+            "position": position,
+            "duration": duration,
+            "preserve_aspect_ratio": raw.get("preserve_aspect_ratio") is not False,
+            "frame": bool(raw.get("frame", False)),
+        }
+    low = note.lower()
+    enabled = "logo" in low
+    top_left = ("alto a sinistra" in low) or ("top-left" in low) or ("top left" in low)
+    full = ("tutta la durata" in low) or ("intera durata" in low) or ("full duration" in low)
+    return {
+        "enabled": enabled,
+        "position": "top-left" if top_left or enabled else "",
+        "duration": "full" if full or enabled else "",
+        "preserve_aspect_ratio": True,
+        "frame": False,
+    }
+
+
+def _prepare_logo_overlay(logo: Image.Image) -> Image.Image:
+    """Preserve the supplied logo while removing only fully transparent outer padding."""
+    src = logo.copy().convert("RGBA")
+    alpha = src.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox:
+        src = src.crop(bbox)
+    return src
 
 
 def _normalize_assets(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -132,6 +168,7 @@ def register_commercial(app) -> None:
         correction_note = str(payload.get("correction_note") or "").strip()
         issues = [str(x).upper() for x in payload.get("issues", [])] if isinstance(payload.get("issues"), list) else []
         correction_assets = _normalize_assets(payload)
+        logo_overlay = _logo_overlay_contract(payload, correction_note)
 
         required = {
             "evs_code": evs_code,
@@ -171,6 +208,10 @@ def register_commercial(app) -> None:
             asset1 = Image.open(a1p).convert("RGBA")
             asset2 = Image.open(a2p).convert("RGBA")
             logo = Image.open(lp).convert("RGBA")
+            if logo_overlay["enabled"]:
+                if logo_overlay["position"] != "top-left" or logo_overlay["duration"] != "full":
+                    raise ValueError("UNSUPPORTED_LOGO_OVERLAY_CONTRACT")
+                logo = _prepare_logo_overlay(logo)
 
             loaded: list[tuple[dict[str, Any], Image.Image]] = []
             for idx, meta in enumerate(correction_assets):
@@ -263,6 +304,8 @@ def register_commercial(app) -> None:
             "commercial_engine_version": 4,
             "correction_mode": correction_mode,
             "correction_note": correction_note,
+            "logo_overlay_contract": logo_overlay,
+            "logo_overlay_applied": bool(logo_overlay["enabled"]),
             "issues": issues,
             "focused_asset_crops": focus_enabled,
             "guided_multi_asset": user_asset_override,
@@ -290,6 +333,13 @@ def register_commercial(app) -> None:
             "desktop_asset_composited": True,
             "mobile_asset_composited": True,
             "logo_composited_deterministically": True,
+            "logo_overlay_requested": bool(logo_overlay["enabled"]),
+            "logo_overlay_applied": bool(logo_overlay["enabled"]),
+            "logo_overlay_position": logo_overlay["position"] if logo_overlay["enabled"] else None,
+            "logo_overlay_duration": logo_overlay["duration"] if logo_overlay["enabled"] else None,
+            "logo_overlay_preserve_aspect_ratio": bool(logo_overlay["preserve_aspect_ratio"]) if logo_overlay["enabled"] else None,
+            "logo_overlay_frame": bool(logo_overlay["frame"]) if logo_overlay["enabled"] else None,
+            "correction_contract_pass": (not logo_overlay["enabled"]) or (logo_overlay["position"] == "top-left" and logo_overlay["duration"] == "full" and logo_overlay["preserve_aspect_ratio"] and not logo_overlay["frame"]),
             "cta_composited_deterministically": True,
             "ai_brand_redraw": False,
             "cuts_only": False,
