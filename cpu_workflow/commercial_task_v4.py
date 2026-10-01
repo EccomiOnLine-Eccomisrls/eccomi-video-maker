@@ -1,3 +1,4 @@
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -159,44 +160,152 @@ def _smart_motion_layer(base: Image.Image, preset: str, phase: float) -> Image.I
     return Image.alpha_composite(base.convert("RGBA"), layer)
 
 
-def _guided_frame(asset: Image.Image, logo: Image.Image, title: str = "") -> Image.Image:
-    """Large single-asset scene for recovery uploads.
+def _smart_motion_temporal_probe(base: Image.Image, preset: str) -> dict[str, Any]:
+    """Verify that a preset actually changes over time before a render can pass QA."""
+    early = _smart_motion_layer(base, preset, 0.10)
+    late = _smart_motion_layer(base, preset, 0.90)
+    diff = ImageChops.difference(early.convert("RGB"), late.convert("RGB")).convert("L")
+    hist = diff.histogram()
+    total_pixels = max(1, diff.width * diff.height)
+    unchanged = hist[0] if hist else total_pixels
+    changed_pixels = max(0, total_pixels - unchanged)
+    max_delta = max((idx for idx, count in enumerate(hist) if count), default=0)
+    mean_delta = sum(idx * count for idx, count in enumerate(hist)) / total_pixels
+    passed = changed_pixels >= 1200 and max_delta >= 2
+    return {
+        "preset": preset,
+        "phase_start": 0.10,
+        "phase_end": 0.90,
+        "changed_pixels": changed_pixels,
+        "changed_ratio": round(changed_pixels / total_pixels, 6),
+        "mean_delta": round(mean_delta, 6),
+        "max_delta": int(max_delta),
+        "pass": bool(passed),
+    }
 
-    The operator upload is treated as the approved framing: no auto crop, no phone/card
-    shell, no second asset in the same scene. It is simply contained as large as possible.
-    """
-    base = v2._gradient()
-    v2._frame_logo(base, logo)
-    draw = ImageDraw.Draw(base)
+
+def _guided_frame_layers(asset: Image.Image, logo: Image.Image, title: str = "") -> tuple[Image.Image, Image.Image]:
+    """Return background + locked foreground so Smart Motion stays below approved assets."""
+    background = v2._gradient()
+    foreground = Image.new("RGBA", background.size, (0, 0, 0, 0))
+    v2._frame_logo(foreground, logo)
+    draw = ImageDraw.Draw(foreground)
     if title:
         v2._draw_multiline_centered(draw, title, 185, 45, max_width=950, bold=True)
 
-    # 270..1845 gives a tall usable area. A 9:16 screenshot reaches about 82% of
-    # the 1080px canvas width while remaining fully visible and un-cropped.
+    # Preserve the operator-approved crop exactly: contain only, never auto-crop.
     visual = _fit_exact(asset, 980, 1575)
     x = (v2.OUT_W - visual.width) // 2
     y = 270 + max(0, (1575 - visual.height) // 2)
-    base.alpha_composite(visual, (x, y))
-    return base
+    foreground.alpha_composite(visual, (x, y))
+    return background, foreground
 
 
-def _guided_final(asset: Image.Image, logo: Image.Image, title: str, offer: str, cta: str) -> Image.Image:
-    base = v2._gradient()
-    v2._frame_logo(base, logo)
-    draw = ImageDraw.Draw(base)
+def _guided_final_layers(
+    asset: Image.Image,
+    logo: Image.Image,
+    title: str,
+    offer: str,
+    cta: str,
+) -> tuple[Image.Image, Image.Image]:
+    background = v2._gradient()
+    foreground = Image.new("RGBA", background.size, (0, 0, 0, 0))
+    v2._frame_logo(foreground, logo)
+    draw = ImageDraw.Draw(foreground)
     if title:
         v2._draw_multiline_centered(draw, title, 180, 49, max_width=950, bold=True)
 
     visual = _fit_exact(asset, 950, 1260)
     x = (v2.OUT_W - visual.width) // 2
     y = 315 + max(0, (1260 - visual.height) // 2)
-    base.alpha_composite(visual, (x, y))
+    foreground.alpha_composite(visual, (x, y))
 
     if offer:
         v2._draw_centered(draw, offer, 1510, 40, True, fill=(220, 235, 255, 255), max_width=850)
     draw.rounded_rectangle((95, 1625, 985, 1800), radius=86, fill=(255, 255, 255, 255))
     v2._draw_centered(draw, cta, 1677, 38, True, fill=(5, 39, 120, 255), max_width=820)
-    return base
+    return background, foreground
+
+
+def _guided_frame(asset: Image.Image, logo: Image.Image, title: str = "") -> Image.Image:
+    background, foreground = _guided_frame_layers(asset, logo, title)
+    return Image.alpha_composite(background, foreground)
+
+
+def _guided_final(asset: Image.Image, logo: Image.Image, title: str, offer: str, cta: str) -> Image.Image:
+    background, foreground = _guided_final_layers(asset, logo, title, offer, cta)
+    return Image.alpha_composite(background, foreground)
+
+
+def _render_temporal_motion_segment(
+    ffmpeg: str,
+    background: Image.Image,
+    foreground: Image.Image,
+    preset: str,
+    duration: float,
+    output: Path,
+) -> None:
+    """Stream frame-by-frame Smart Motion below the locked foreground.
+
+    This intentionally does not rasterize motion at one phase. Each encoded frame gets
+    its own phase from 0..1, while approved imagery, text, logo and CTA remain unchanged.
+    """
+    fps = int(v2.FPS)
+    frame_count = max(2, int(round(duration * fps)))
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-loglevel",
+        "error",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s:v",
+        f"{v2.OUT_W}x{v2.OUT_H}",
+        "-r",
+        str(fps),
+        "-i",
+        "pipe:0",
+        "-t",
+        f"{duration:.3f}",
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "18",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        if proc.stdin is None:
+            raise RuntimeError("SMART_MOTION_STDIN_UNAVAILABLE")
+        for frame_idx in range(frame_count):
+            phase = frame_idx / max(1, frame_count - 1)
+            animated_background = _smart_motion_layer(background, preset, phase)
+            composed = Image.alpha_composite(animated_background, foreground).convert("RGB")
+            proc.stdin.write(composed.tobytes())
+        proc.stdin.close()
+        stderr = proc.stderr.read().decode("utf-8", errors="replace") if proc.stderr else ""
+        code = proc.wait()
+        if code != 0:
+            raise RuntimeError(f"SMART_MOTION_FFMPEG_FAILED ({code}): {stderr[-1600:]}")
+    except Exception:
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+        except Exception:
+            pass
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        raise
 
 
 def register_commercial(app) -> None:
@@ -280,6 +389,10 @@ def register_commercial(app) -> None:
 
             focus_enabled = False
             guided_large_layout = False
+            guided_layers: list[tuple[Image.Image, Image.Image]] = []
+            motion_presets: list[str] = []
+            motion_temporal_probes: list[dict[str, Any]] = []
+            smart_motion_temporal_pass = not user_asset_override
             if not user_asset_override:
                 a1_top = v2._focus_crop(asset1, "top")
                 a1_mid = v2._focus_crop(asset1, "middle")
@@ -302,22 +415,30 @@ def register_commercial(app) -> None:
                 s3 = _pick(video_assets, 2, s2)
                 s4 = _pick(video_assets, 3, s3)
                 s5 = final_assets[0] if final_assets else _pick(video_assets, 4, s4)
-                frames = [
-                    _guided_frame(s1, logo, headline),
-                    _guided_frame(s2, logo, scene2),
-                    _guided_frame(s3, logo, scene3),
-                    _guided_frame(s4, logo, scene4),
-                    _guided_final(s5, logo, final_title, offer, cta),
+                guided_layers = [
+                    _guided_frame_layers(s1, logo, headline),
+                    _guided_frame_layers(s2, logo, scene2),
+                    _guided_frame_layers(s3, logo, scene3),
+                    _guided_frame_layers(s4, logo, scene4),
+                    _guided_final_layers(s5, logo, final_title, offer, cta),
                 ]
                 motion_titles = [headline, scene2, scene3, scene4, final_title]
                 motion_presets = [_smart_motion_preset(t, i) for i, t in enumerate(motion_titles)]
-                frames = [_smart_motion_layer(frame, motion_presets[i], 0.5) for i, frame in enumerate(frames)]
+                motion_temporal_probes = [
+                    _smart_motion_temporal_probe(background, motion_presets[i])
+                    for i, (background, _foreground) in enumerate(guided_layers)
+                ]
+                smart_motion_temporal_pass = all(x["pass"] for x in motion_temporal_probes)
+                if not smart_motion_temporal_pass:
+                    raise RuntimeError(f"SMART_MOTION_TEMPORAL_QA_FAILED: {motion_temporal_probes}")
+                frames = []
 
             frame_paths: list[Path] = []
-            for idx, frame in enumerate(frames):
-                p = root / f"frame_{idx}.png"
-                frame.save(p)
-                frame_paths.append(p)
+            if not user_asset_override:
+                for idx, frame in enumerate(frames):
+                    p = root / f"frame_{idx}.png"
+                    frame.save(p)
+                    frame_paths.append(p)
 
             durations = [2.35, 2.65, 2.65, 2.85, 4.50] if correction_mode else [2.5, 3.0, 3.0, 3.0, 3.5]
             factor = target_duration / sum(durations)
@@ -326,17 +447,32 @@ def register_commercial(app) -> None:
 
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             segments: list[Path] = []
-            for idx, (frame_path, duration) in enumerate(zip(frame_paths, durations)):
-                seg = root / f"seg_{idx}.mp4"
-                v2._motion_segment(
-                    ffmpeg,
-                    frame_path,
-                    duration,
-                    seg,
-                    zoom_in=(idx % 2 == 0),
-                    stronger=correction_mode or focus_enabled or user_asset_override,
-                )
-                segments.append(seg)
+            if user_asset_override:
+                for idx, ((background, foreground), duration, preset) in enumerate(
+                    zip(guided_layers, durations, motion_presets)
+                ):
+                    seg = root / f"seg_{idx}.mp4"
+                    _render_temporal_motion_segment(
+                        ffmpeg,
+                        background,
+                        foreground,
+                        preset,
+                        duration,
+                        seg,
+                    )
+                    segments.append(seg)
+            else:
+                for idx, (frame_path, duration) in enumerate(zip(frame_paths, durations)):
+                    seg = root / f"seg_{idx}.mp4"
+                    v2._motion_segment(
+                        ffmpeg,
+                        frame_path,
+                        duration,
+                        seg,
+                        zoom_in=(idx % 2 == 0),
+                        stronger=correction_mode or focus_enabled,
+                    )
+                    segments.append(seg)
 
             visual = root / "visual.mp4"
             output = root / "commercial.mp4"
@@ -360,7 +496,12 @@ def register_commercial(app) -> None:
             "commercial_product_service": True,
             "commercial_engine_version": 5,
             "smart_motion_layer": bool(user_asset_override),
+            "smart_motion_version": "1.1",
             "smart_motion_presets": motion_presets if user_asset_override else [],
+            "smart_motion_temporal_render": bool(user_asset_override),
+            "smart_motion_temporal_pass": bool(smart_motion_temporal_pass),
+            "smart_motion_temporal_probes": motion_temporal_probes if user_asset_override else [],
+            "smart_motion_under_foreground": bool(user_asset_override),
             "correction_mode": correction_mode,
             "correction_note": correction_note,
             "logo_overlay_contract": logo_overlay,
@@ -385,7 +526,7 @@ def register_commercial(app) -> None:
             "total_seconds": elapsed,
         }
         qa = {
-            "technical_pass": True,
+            "technical_pass": bool((not user_asset_override) or smart_motion_temporal_pass),
             "output_width": v2.OUT_W,
             "output_height": v2.OUT_H,
             "target_duration_seconds": target_duration,
@@ -409,6 +550,11 @@ def register_commercial(app) -> None:
             "commercial_product_service": True,
             "commercial_engine_version": 5,
             "smart_motion_layer_applied": bool(user_asset_override),
+            "smart_motion_version": "1.1",
+            "smart_motion_temporal_pass": bool(smart_motion_temporal_pass),
+            "smart_motion_temporal_probes": motion_temporal_probes if user_asset_override else [],
+            "smart_motion_under_foreground": bool(user_asset_override),
+            "smart_motion_static_snapshot_only": False if user_asset_override else None,
             "motion_safe_area_pass": True,
             "guided_multi_asset": user_asset_override,
             "guided_large_layout": guided_large_layout,
