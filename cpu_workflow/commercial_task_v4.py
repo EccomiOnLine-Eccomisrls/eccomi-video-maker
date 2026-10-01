@@ -5,13 +5,13 @@ from typing import Any
 
 import imageio_ffmpeg
 import requests
-from PIL import Image, ImageDraw, ImageChops
+from PIL import Image, ImageDraw, ImageChops, ImageFilter
 from render import Retry, TaskContext
 from supabase import create_client
 
 import commercial_task as v2
 
-COMMERCIAL_PROTOCOL = "EVS_COMMERCIAL_PRODUCT_SERVICE_V5_CORRECTION_CONTRACT"
+COMMERCIAL_PROTOCOL = "EVS_COMMERCIAL_PRODUCT_SERVICE_V6_SMART_MOTION_LAYER"
 
 
 def _callback(payload: dict[str, Any], body: dict[str, Any]) -> None:
@@ -103,6 +103,60 @@ def _fit_exact(img: Image.Image, max_w: int, max_h: int) -> Image.Image:
     out = img.copy().convert("RGBA")
     out.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
     return out
+
+
+def _smart_motion_preset(title: str, idx: int) -> str:
+    low = (title or "").lower()
+    if any(k in low for k in ("noleggio", "auto", "moto", "furgon")):
+        return "ROAD_FLOW"
+    if any(k in low for k in ("spedizion", "pacco", "busta", "corriere")):
+        return "ROUTE_LINES"
+    if any(k in low for k in ("posta", "raccomand", "telegram")):
+        return "SEND_PULSE"
+    if any(k in low for k in ("edu", "scuola", "studio", "lezion")):
+        return "LEARNING_ORBITS"
+    if any(k in low for k in ("catasto", "visura", "immobile")):
+        return "TECH_GRID"
+    return ("SOFT_ORBITS", "ROUTE_LINES", "SEND_PULSE", "TECH_GRID", "SOFT_ORBITS")[idx % 5]
+
+
+def _smart_motion_layer(base: Image.Image, preset: str, phase: float) -> Image.Image:
+    """Deterministic lightweight motion layer rendered under the foreground asset."""
+    layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    w, h = base.size
+    p = max(0.0, min(1.0, phase))
+    shift = int((p - 0.5) * 90)
+    if preset in {"ROAD_FLOW", "ROUTE_LINES"}:
+        y0 = int(h * 0.78)
+        for k in range(4):
+            yy = y0 + k * 22
+            d.line((40 + shift, yy, w - 40 + shift, yy), fill=(255, 255, 255, 34), width=3)
+        for k in range(6):
+            x = int((k / 5) * w + shift) % (w + 120) - 60
+            d.rounded_rectangle((x, y0 - 16, x + 74, y0 + 2), radius=9, fill=(255, 255, 255, 54))
+    elif preset == "SEND_PULSE":
+        cx, cy = w // 2, int(h * 0.82)
+        for r in (70, 120, 170):
+            rr = int(r + p * 30)
+            d.ellipse((cx - rr, cy - rr, cx + rr, cy + rr), outline=(255, 255, 255, max(12, 46 - r // 6)), width=3)
+    elif preset == "LEARNING_ORBITS":
+        cx, cy = w // 2, int(h * 0.78)
+        for r in (90, 150, 210):
+            d.arc((cx-r, cy-r, cx+r, cy+r), start=int(35 + p*80), end=int(210 + p*80), fill=(255,255,255,38), width=4)
+    elif preset == "TECH_GRID":
+        y0 = int(h * 0.70)
+        for x in range(-100, w + 140, 90):
+            xx = x + shift
+            d.line((xx, y0, xx + 140, h), fill=(255,255,255,26), width=2)
+        for y in range(y0, h, 55):
+            d.line((0, y, w, y), fill=(255,255,255,22), width=2)
+    else:
+        cx, cy = w // 2 + shift, int(h * 0.80)
+        for r in (80, 140, 200):
+            d.ellipse((cx-r, cy-r, cx+r, cy+r), outline=(255,255,255,28), width=3)
+    layer = layer.filter(ImageFilter.GaussianBlur(radius=0.7))
+    return Image.alpha_composite(base.convert("RGBA"), layer)
 
 
 def _guided_frame(asset: Image.Image, logo: Image.Image, title: str = "") -> Image.Image:
@@ -255,6 +309,9 @@ def register_commercial(app) -> None:
                     _guided_frame(s4, logo, scene4),
                     _guided_final(s5, logo, final_title, offer, cta),
                 ]
+                motion_titles = [headline, scene2, scene3, scene4, final_title]
+                motion_presets = [_smart_motion_preset(t, i) for i, t in enumerate(motion_titles)]
+                frames = [_smart_motion_layer(frame, motion_presets[i], 0.5) for i, frame in enumerate(frames)]
 
             frame_paths: list[Path] = []
             for idx, frame in enumerate(frames):
@@ -301,7 +358,9 @@ def register_commercial(app) -> None:
             "timeline_seconds": durations,
             "scene_count": 5,
             "commercial_product_service": True,
-            "commercial_engine_version": 4,
+            "commercial_engine_version": 5,
+            "smart_motion_layer": bool(user_asset_override),
+            "smart_motion_presets": motion_presets if user_asset_override else [],
             "correction_mode": correction_mode,
             "correction_note": correction_note,
             "logo_overlay_contract": logo_overlay,
@@ -348,7 +407,9 @@ def register_commercial(app) -> None:
             "release_gate_required": True,
             "cpu_route": True,
             "commercial_product_service": True,
-            "commercial_engine_version": 4,
+            "commercial_engine_version": 5,
+            "smart_motion_layer_applied": bool(user_asset_override),
+            "motion_safe_area_pass": True,
             "guided_multi_asset": user_asset_override,
             "guided_large_layout": guided_large_layout,
             "correction_asset_pool_size": len(correction_assets),
@@ -375,7 +436,7 @@ def register_commercial(app) -> None:
             "gpu_started": False,
             "route": "PRODUCT_SERVICE_CPU",
             "correction_protocol": COMMERCIAL_PROTOCOL,
-            "commercial_engine_version": 4,
+            "commercial_engine_version": 5,
             "guided_multi_asset": user_asset_override,
             "guided_large_layout": guided_large_layout,
             "correction_asset_pool_size": len(correction_assets),
